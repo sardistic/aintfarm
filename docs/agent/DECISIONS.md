@@ -67,3 +67,9 @@ The gene bank is a CPU-side nearest-neighbor archive (unstructured MAP-Elites/CV
 - **Download.** `freeList` doubles as the download area for `gather`.
 
 Uploads and downloads run in their own submits before the frame's steps, so they never race the free list or split requests. Only genomes with at least one offspring enter the bank. The bank persists in localStorage, keyed by F and HMAX.
+
+## 2026-11-08 — Publish as aintfarm.sardistic.com
+
+Field Life is the product, so it serves at `/`. The ant farm stays reachable at `/farm`, unchanged, because its absolute asset paths still resolve from there. Production is a single non-root Node container built from this repository's `main` branch, matching the house pattern for small public apps: a Git checkout on the host, Docker Compose, Cloudflare Tunnel, and no published ports. Host-specific details live in the private infrastructure runbook, not here.
+
+The server sends `Cache-Control: no-cache` so deploys are visible at once through Cloudflare. It answers HEAD requests, for probes, and exposes `/healthz` for the container healthcheck. Pages carry the sardistic eye favicon, the shared `sardize/transit.js` cross-site transition, and a fixed eye link back to sardistic.com.

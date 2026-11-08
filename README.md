@@ -1,4 +1,8 @@
-# Art Farm: Microbial World
+# aintfarm
+
+Live at <https://aintfarm.sardistic.com>. **Field Life** (the WebGPU neural-particle world, `public/field/`) is the homepage. The original ant farm below is at `/farm`.
+
+## Art Farm: Microbial World
 
 A local browser simulation of a microbial world over a black sand substrate. Larger membrane-bound organisms swim through the culture, collect smaller cells, grow, hunt rival families, rest, divide into mutated offspring, and die back into the cell population. The original ant-like agents still work the sand with distinct, untrained 9,904-parameter recurrent controllers. A second population of 36,000 motile cells makes the culture move at a dense scale.
 
