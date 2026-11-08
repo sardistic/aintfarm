@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <link rel="icon" href="https://sardistic.com/wp-content/sardize/eye.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="https://sardistic.com/wp-content/sardize/eye-180.png">
+  <script src="https://sardistic.com/wp-content/sardize/transit.js?v=2"></script>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Art Farm — Microbial World</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="farm-frame" aria-label="Living sand culture">
+    <div class="glass">
+      <canvas id="pond" width="1000" height="650" aria-hidden="true"></canvas>
+      <canvas id="art" width="1000" height="650" aria-label="Black sand and tunnels"></canvas>
+      <canvas id="overlay" width="1000" height="650" aria-label="Agents and food"></canvas>
+    </div>
+
+    <div class="hud hud-top">
+      <span class="farm-name">ART FARM <span class="farm-name-sub">/ MICROBIAL WORLD</span></span>
+      <div class="live-counts" aria-live="off">
+        <span><b id="microbeCount">84</b> ORGANISMS</span>
+        <span><b id="workersCount">180</b> NEURAL ANTS</span>
+        <span><b id="cultureCount">36K</b> CELLS</span>
+        <span><b id="births">0</b> DIVIDED</span>
+        <span><b id="deaths">0</b> DIED</span>
+      </div>
+      <button id="settingsToggle" class="glass-button settings-toggle" type="button" aria-controls="panel" aria-expanded="false" aria-label="Open controls" title="Controls">☷</button>
+    </div>
+
+    <div class="tool-rail" id="tools" role="toolbar" aria-label="Farm tools">
+      <button class="selected" data-tool="move" type="button" aria-label="Move a grain" title="Move a grain">↗</button>
+      <button data-tool="remove" type="button" aria-label="Remove grains" title="Remove grains">−</button>
+      <button data-tool="add" type="button" aria-label="Pour loose grains" title="Pour loose grains">＋</button>
+      <button data-tool="inspect" type="button" aria-label="Inspect life" title="Inspect an organism or agent">⌕</button>
+    </div>
+
+    <div class="zoom-controls" role="group" aria-label="View zoom">
+      <button id="zoomOut" type="button" aria-label="Zoom out" title="Zoom out">−</button>
+      <button id="zoomLevel" type="button" aria-label="Reset zoom" title="Reset zoom">100%</button>
+      <button id="zoomIn" type="button" aria-label="Zoom in" title="Zoom in">+</button>
+    </div>
+
+    <div class="hud hud-bottom">
+      <span id="toolHelp">DRAG A GRAIN TO MOVE IT</span>
+      <span id="microbeActivity">ORGANISMS SEEKING FOOD</span>
+      <div class="bottom-actions">
+        <span id="canvasState">EVOLVING</span>
+        <span id="time">00:00</span>
+        <button id="pause" class="glass-button pause-button" type="button">Pause world <span>Ⅱ</span></button>
+      </div>
+    </div>
+
+    <aside class="panel" id="panel" aria-label="Farm controls" hidden>
+      <div class="panel-title"><span>CONTROLS</span><button id="closePanel" class="panel-close" type="button" aria-label="Close controls">×</button></div>
+      <span id="mode" class="status"><i></i> LOCAL SIMULATION</span>
+      <div class="sliderrow"><label for="population">Starting neural ants</label><output id="popValue">180</output></div>
+      <input id="population" type="range" min="30" max="800" step="10" value="180">
+      <div class="sliderrow"><label for="speed">Time flow</label><output id="speedValue">1×</output></div>
+      <input id="speed" type="range" min="1" max="4" value="1">
+
+      <div class="panel-title section-title"><span>MICROBIAL WORLD</span><span id="microbeMood">GROWING</span></div>
+      <p class="panel-note">Bright membranes are organisms swimming over the black sand substrate. They draw in small cells, grow, hunt other families, rest, divide, and return their bodies to the culture when they die. Click one with the inspect tool to see its needs and inherited traits.</p>
+      <div class="metrics">
+        <div><strong id="microbeLiving">84</strong><span>ORGANISMS</span></div>
+        <div><strong id="microbeCaptures">0</strong><span>CELLS GATHERED</span></div>
+        <div><strong id="microbeBattles">0</strong><span>ATTACKS</span></div>
+        <div><strong id="microbeDivisions">0</strong><span>DIVISIONS</span></div>
+        <div><strong id="microbeLargest">0</strong><span>LARGEST BODY</span></div>
+        <div><strong id="microbeDeaths">0</strong><span>MICROBE DEATHS</span></div>
+        <div><strong id="microbeMutations">0</strong><span>LARGE MUTATIONS</span></div>
+      </div>
+      <div class="panel-title section-title"><span>ORGANISM FAMILIES</span><span>LIVE MEMBERS</span></div>
+      <div id="microbeFamilies" class="lineage-board"></div>
+
+      <div class="panel-title section-title"><span>NEURAL ANTS / SAND</span><span id="nestMood">EVOLVING</span></div>
+      <div class="metrics">
+        <div><strong id="brood">0</strong><span>GENERATION</span></div>
+        <div><strong id="capacity">180</strong><span>LINEAGES</span></div>
+        <div><strong id="excavated">0</strong><span>GRAINS DUG</span></div>
+        <div><strong id="spoil">0</strong><span>GRAINS DROPPED</span></div>
+        <div><strong id="foodStored">0</strong><span>HARVESTS</span></div>
+        <div><strong id="storedFood">0</strong><span>FOOD IN NEST</span></div>
+        <div><strong id="reactions">0</strong><span>CHEMICAL CONTACTS</span></div>
+        <div><strong id="mutations">0</strong><span>MUTATION BURSTS</span></div>
+        <div><strong id="cultureBirths">0</strong><span>CELL BIRTHS</span></div>
+        <div><strong id="cultureMutations">0</strong><span>CELL MACRO MUTATIONS</span></div>
+      </div>
+      <div id="taskCounts" class="task-counts">SUCCESSFUL MOVES 0 · DIGS 0 · BIRTHS 0/0 ATTEMPTS · FOOD DELIVERED 0</div>
+      <p id="nestNote" class="panel-note">Buried food becomes usable when sand is removed.</p>
+      <p class="panel-note">Food grows and spreads without placement. Chemical emissions and receptors mutate independently. When agents meet, their chemistry can cause cooperation, conflict, or a nutrient bloom. Movement, digging, feeding, metabolism, lifespan, reproduction, pigment, and mutation rate also evolve.</p>
+      <div class="panel-title section-title"><span>NEURAL ANT FAMILIES</span><span>LIVE DESCENDANTS</span></div>
+      <p class="panel-note">A lineage is every descendant of one starting agent. Generation counts births from that founder. Color and traits can drift within a family.</p>
+      <div id="lineageBoard" class="lineage-board"></div>
+      <div class="button-row">
+        <button id="reset" type="button">Fresh world ↗</button>
+        <button id="download" type="button">Save image ↓</button>
+      </div>
+
+      <div class="panel-title section-title"><span>EVOLUTION LOG</span><span>RECENT EVENTS</span></div>
+      <div id="eventLog" class="event-log">Waiting for a dig, harvest, birth, or death.</div>
+      <button id="downloadLog" class="export-log" type="button">Export run log ↓</button>
+
+      <div class="panel-title section-title"><span>INSPECT LIFE</span><span id="selectedRole">NONE SELECTED</span></div>
+      <div id="brainDetails" class="brain-details">Select the inspect tool, then click a microorganism or neural agent.</div>
+
+      <div class="panel-title section-title"><span>JEV'S EYE</span><span id="jevBadge">OPTIONAL</span></div>
+      <button id="critique" type="button">Ask Jev to look ◎</button>
+      <div id="critiqueResult" class="critique-result" aria-live="polite">Jev observes the image when asked.</div>
+    </aside>
+  </main>
+  <script type="module" src="/app.js"></script>
+  <a class="sard-eye" href="https://sardistic.com/" title="sardistic.com" aria-label="sardistic.com"><img src="https://sardistic.com/wp-content/sardize/eye.svg" alt="" width="28" height="28"></a>
+  <style>.sard-eye{position:fixed;left:10px;bottom:10px;z-index:50;display:block;width:28px;height:28px;opacity:.7;transition:opacity .15s,transform .15s;filter:drop-shadow(0 0 4px rgba(0,0,0,.8))}.sard-eye:hover,.sard-eye:focus-visible{opacity:1;transform:scale(1.12)}.sard-eye img{display:block;width:100%;height:100%}</style>
+</body>
+</html>

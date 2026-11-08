@@ -1,0 +1,6 @@
+.env
+node_modules/
+docs/agent/HANDOFF.md
+.agent/runtime/
+*.png
+!public/**/*.png

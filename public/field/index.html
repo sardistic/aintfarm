@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Field Life — aintfarm</title>
+  <meta name="description" content="Hundreds of thousands of particles, each its own untrained, mutating neural net with mutable physics, evolving on a shared field. Runs on your GPU with WebGPU.">
+  <link rel="icon" href="https://sardistic.com/wp-content/sardize/eye.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="https://sardistic.com/wp-content/sardize/eye-180.png">
+  <script src="https://sardistic.com/wp-content/sardize/transit.js?v=2"></script>
+  <style>
+    :root { --fg: #d8f0e0; --dim: #7a8a80; --panel: rgba(8, 10, 12, 0.84); --line: rgba(255,255,255,0.12); --acc: #6fe3a8; }
+    html, body { margin: 0; height: 100%; background: #000; color: var(--fg); font: 12px/1.4 ui-monospace, Consolas, monospace; overflow: hidden; }
+    #c { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; cursor: crosshair; touch-action: none; }
+    #hud { position: fixed; top: 6px; left: 8px; pointer-events: none; text-shadow: 0 0 3px #000, 0 0 3px #000; white-space: pre; }
+    #panel { position: fixed; top: 8px; right: 8px; width: 272px; max-height: calc(100vh - 16px); overflow-y: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; backdrop-filter: blur(6px); box-sizing: border-box; }
+    #panel.collapsed > :not(header) { display: none; }
+    #panel header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+    #panel h1, #panel h2 { font-size: 12px; margin: 0; letter-spacing: 0.08em; }
+    #panel h2 { margin: 12px 0 4px; padding-top: 8px; border-top: 1px solid var(--line); color: var(--dim); font-weight: normal; }
+    label { display: grid; grid-template-columns: 92px 1fr 52px; align-items: center; gap: 6px; margin: 4px 0; color: var(--dim); }
+    label.check { display: flex; gap: 6px; }
+    label output { color: var(--fg); text-align: right; }
+    input[type=range] { width: 100%; accent-color: var(--acc); }
+    select, button { background: #111; color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: 3px 7px; font: inherit; cursor: pointer; }
+    button:hover, select:hover { border-color: var(--acc); }
+    button.on { border-color: var(--acc); color: var(--acc); }
+    .row { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0; }
+    .pre { white-space: pre; }
+    #stats, #effects, #species { white-space: pre; }
+    #effects { color: var(--dim); }
+    #map { width: 100%; height: 170px; background: #050607; border: 1px solid var(--line); border-radius: 4px; cursor: pointer; display: block; }
+    #species { margin-top: 4px; white-space: pre-wrap; min-height: 2.8em; }
+    details { color: var(--dim); margin-top: 8px; }
+    details p { margin: 4px 0; }
+    #err { position: fixed; inset: 0; display: none; place-items: center; padding: 24px; color: #ff9a9a; white-space: pre-wrap; background: #000; }
+    input[type=file] { display: none; }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <div id="hud">starting…</div>
+  <aside id="panel">
+    <header><h1>FIELD LIFE</h1><button id="collapse" type="button" title="Collapse">–</button></header>
+    <label>sunlight <input id="sun" type="range" min="0" max="3" step="0.05" value="1"><output></output></label>
+    <label>metabolism <input id="metab" type="range" min="0" max="0.006" step="0.0001" value="0.0012"><output></output></label>
+    <label>param cost <input id="pcost" type="range" min="0" max="0.00002" step="0.0000005" value="0.000001"><output></output></label>
+    <label>mutation <input id="mut" type="range" min="0" max="4" step="0.05" value="1"><output></output></label>
+    <label>pressure <input id="pressure" type="range" min="0" max="1" step="0.01" value="0.3"><output></output></label>
+    <label title="Attraction toward denser regions at each particle's sensing range; with short-range pressure this gives surface tension">cohesion <input id="cohesion" type="range" min="0" max="1" step="0.01" value="0.15"><output></output></label>
+    <label>steps/frame <input id="spf" type="range" min="1" max="8" step="1" value="2"><output></output></label>
+    <label>brush <input id="brush" type="range" min="2" max="120" step="1" value="24"><output></output></label>
+    <label>field gain <input id="fgain" type="range" min="0" max="4" step="0.05" value="1"><output></output></label>
+    <div class="row">
+      <select id="mode" title="View (keys 1–5)">
+        <option value="0">field + particles</option>
+        <option value="1">particles</option>
+        <option value="2">field</option>
+        <option value="3">sunlight</option>
+        <option value="4">density</option>
+      </select>
+      <button id="pause" type="button">pause</button>
+      <button id="seed" type="button" title="Spawn random (untrained) particles into empty slots">seed</button>
+      <button id="reset" type="button">reset</button>
+    </div>
+    <div class="row">
+      <button id="toolErase" class="on" type="button" title="Left-drag kills particles (E)">erase</button>
+      <button id="toolPlant" type="button" title="Left-click plants the selected gene-bank species (P)">plant</button>
+    </div>
+    <div id="stats"></div>
+
+    <h2>EFFECT GENES IN POPULATION</h2>
+    <div id="effects"></div>
+
+    <h2>GENE BANK</h2>
+    <canvas id="map" width="496" height="340" title="Each dot is an archived net, placed by a PCA of its phenotype vector. Click to select."></canvas>
+    <div id="bankStats" class="pre"></div>
+    <div id="species">click a dot to select a species</div>
+    <div class="row">
+      <button id="plantRandom" type="button" title="Plant a random archived species somewhere">plant random</button>
+      <label class="check" title="Every 15 s, plant an archived species to counter monocultures"><input id="immigrate" type="checkbox" checked> immigration</label>
+    </div>
+    <div class="row">
+      <button id="bankSave" type="button" title="Download the gene bank as JSON">export</button>
+      <button id="bankLoad" type="button" title="Load a gene bank JSON">import</button>
+      <button id="bankClear" type="button">clear</button>
+      <input id="bankFile" type="file" accept="application/json,.json">
+    </div>
+
+    <details>
+      <summary>how it works</summary>
+      <p>Each particle is its own neural net. Nets start random (untrained) and are never trained by gradients. Selection is what shapes them.</p>
+      <p>Particles never interact directly. They read, absorb from, and write to a shared G×G×F field. Channel 0 is energy from drifting suns. Channels 1–7 are information. A hidden density channel records how crowded each cell is.</p>
+      <p><b>Chemistry</b> is a per-channel rule: an absorb rate, the energy gained or lost per unit absorbed, and a push along that channel's gradient.</p>
+      <p><b>Effect genes</b> are 4 slots. Each holds one of 13 physics primitives: taxis, swirl, isoline-seeking, catalysis (a→b), jet, anchor, pressure/cohesion, pulsed emission, siphon at range, signal relay (a→b), heat, toxin shield, and global drift. Every slot has its own channels and parameters, and its strength is gated by the net on each step. Mutation can rewrite a slot into any effect, rewire its channels, or retune it.</p>
+      <p>The <b>net</b> sees the field and its gradients at an evolved range, plus density, energy, velocity, 2 memory registers it writes itself, and an internal clock. It outputs split, child share, write, aim, memory, and 4 effect gates. The hidden width mutates.</p>
+      <p>The <b>gene bank</b> is a vector database of evolved nets. Every second, the GPU samples genomes that have reproduced. Each is embedded as a 49-dim vector of chemistry, effects, architecture, and a random projection of its weights. A new genome that lands within the niche radius of an existing entry replaces it only if it's fitter (more offspring). Otherwise it becomes a new niche. The map is a live PCA of that space. Selected species can be planted, and immigration re-injects archived species to stop monocultures. The bank persists in this browser.</p>
+      <p>The original ant farm is still at <a href="/farm" style="color:var(--acc)">/farm</a>.</p>
+      <p>Left-drag uses the current tool. Scroll zooms. Right- or middle-drag pans. Space pauses. Keys 1–5 switch the view. E and P switch tools.</p>
+    </details>
+  </aside>
+  <div id="err"></div>
+  <script type="module" src="/field/field.js"></script>
+  <a class="sard-eye" href="https://sardistic.com/" title="sardistic.com" aria-label="sardistic.com"><img src="https://sardistic.com/wp-content/sardize/eye.svg" alt="" width="28" height="28"></a>
+  <style>.sard-eye{position:fixed;left:10px;bottom:10px;z-index:50;display:block;width:28px;height:28px;opacity:.7;transition:opacity .15s,transform .15s;filter:drop-shadow(0 0 4px rgba(0,0,0,.8))}.sard-eye:hover,.sard-eye:focus-visible{opacity:1;transform:scale(1.12)}.sard-eye img{display:block;width:100%;height:100%}</style>
+</body>
+</html>
