@@ -70,7 +70,41 @@
     pupil.setAttribute('transform', `translate(${(x * 0.35).toFixed(2)} ${(y * 0.35).toFixed(2)})`);  // a little parallax
     raf = Math.abs(tx - x) + Math.abs(ty - y) > 0.02 ? requestAnimationFrame(tick) : 0;
   }
-  addEventListener('pointermove', e => aim(e.clientX, e.clientY), { passive: true });
-  addEventListener('pointerdown', e => aim(e.clientX, e.clientY), { passive: true });
+  let lastPointer = -1e9;
+  const fromPointer = e => { lastPointer = performance.now(); aim(e.clientX, e.clientY); };
+  addEventListener('pointermove', fromPointer, { passive: true });
+  addEventListener('pointerdown', fromPointer, { passive: true });
   document.addEventListener('pointerleave', () => { tx = 0; ty = 0; if (!raf) raf = requestAnimationFrame(tick); });
+
+  // Tilt: on phones and tablets the iris rolls toward whichever edge is tipped down, like a marble.
+  // Uses device orientation (accelerometer fused with the gyroscope). The way you normally hold the
+  // device becomes "centre" and slowly re-centres; the pointer takes over again for 2 s after it moves.
+  const TILT_RANGE = 25;                 // degrees of tilt for the iris to reach the rim
+  let baseBeta = null, baseGamma = null, lastTilt = 0;
+  function onTilt(e) {
+    if (e.beta == null || e.gamma == null) return;
+    const now = performance.now();
+    if (baseBeta === null) { baseBeta = e.beta; baseGamma = e.gamma; }
+    const k = Math.min(1, (now - (lastTilt || now)) / 4000);   // ~4 s drift back to the resting angle
+    baseBeta += (e.beta - baseBeta) * k; baseGamma += (e.gamma - baseGamma) * k;
+    lastTilt = now;
+    if (now - lastPointer < 2000) return;
+    // device frame: gamma > 0 tips the right edge down, beta rising tips the bottom edge down
+    const vx = (e.gamma - baseGamma) / TILT_RANGE, vy = (e.beta - baseBeta) / TILT_RANGE;
+    const a = ((screen.orientation && screen.orientation.angle) || window.orientation || 0) * Math.PI / 180;
+    let sx = vx * Math.cos(a) + vy * Math.sin(a), sy = -vx * Math.sin(a) + vy * Math.cos(a);
+    const m = Math.hypot(sx, sy);
+    if (m > 1) { sx /= m; sy /= m; }
+    tx = sx * MAX; ty = sy * MAX;
+    if (!raf) raf = requestAnimationFrame(tick);
+  }
+  const DOE = window.DeviceOrientationEvent;
+  if (DOE) {
+    addEventListener('deviceorientation', onTilt, { passive: true });
+    // iOS Safari only starts delivering events after a permission prompt, which must follow a tap.
+    // (Some other browsers expose requestPermission too and simply resolve 'granted'.)
+    if (typeof DOE.requestPermission === 'function') {
+      addEventListener('touchend', () => { DOE.requestPermission().catch(() => {}); }, { once: true, passive: true });
+    }
+  }
 })();
