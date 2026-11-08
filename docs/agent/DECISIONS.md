@@ -87,3 +87,23 @@ In a 60 s run at 131k slots, inject rose from 4.1% to 7.4% of gene slots, bond f
 Energy moves between bonded particles through the field, not by writing another particle's state, which would race. The field stride grew to F+3, adding a per-cell SHARE slot. A bonded giver deposits into the receiver's cell. The cell's occupant collects the whole slot by depositing its negative, and 10% of what remains leaks into channel 0 each step. Every unit is accounted for, so sharing creates no energy.
 
 Uniforms gained `learnOn`, an `effectMask` (from `?off=`), and `founderBias` (the membrane preset makes 70% of founders' first two genes isoline and bond). The source array moved to byte offset 80. GPU time per step comes from a timestamp query around the compute pass, when the adapter supports it. Under heavy contention from another GPU workload, timings and A/B comparisons were not meaningful. Profile on an idle GPU.
+
+## 2026-11-08 — aint farm branding, shared gene bank, visitor strains, nodes, inspector
+
+**Branding.** The site is "aint farm", short for artificial intelligence neural training farm: an ant farm with AI. Field Life is no longer a separate name.
+
+**Shared gene bank.** The layout, decoding, embedding, validation, and niche archive moved into `public/field/genebank.js`. It is imported by both the browser and the Node server, so the shared bank cannot drift from the GPU genome format.
+- **Store.** The server keeps one in-memory archive (cap 400, O(n) pruning of the weakest age-decayed entry) and saves it atomically every 30 s and on SIGTERM to `$DATA_DIR/bank.json`. Production needs a writable `/data` volume.
+- **Trust.** Fitness claims can't be verified, so they are capped and decay (6 h half-life). Genomes must pass the same range checks that GPU output satisfies.
+- **Abuse limits.** Posts are limited per address (CF-Connecting-IP) and globally.
+
+**Visitor strains.** A strain is identified only by a 32-bit tag in the lineage word, which is now strictly inherited (the old random lineage reroll was removed).
+- **Champion model.** A visitor's strain is the champion of their dish, not a fixed genome. A random founder almost always went extinct within a minute, and planting a fit bank genome alone did not hold either. With the champion model, the strain took 99% of a test dish and reached generation 10 in 90 s.
+- **Work credit.** Each upload credits particle-steps per session, capped by elapsed time × 300 steps/s × 262,144 particles.
+- **Immigration.** It is weighted by log10(1 + work / 1e7) and lands at the strain's node.
+
+**Nodes.** A node is a normalized (x, y) in the shared world coordinates, stored per strain on the server.
+
+**Inspector.** It reuses the `gather` kernel with K=1 plus direct buffer copies of the particle and five field cells, so the particle buffer now needs `COPY_SRC`. The net's forward pass is recomputed on the CPU from the genome.
+
+**Auto-fit.** Sizing reloads the page at half N if the average fps over seconds 3–9 is below 22, up to 3 times per session, and stores the result in localStorage. An explicit `?n=` disables it.

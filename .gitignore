@@ -4,3 +4,4 @@ docs/agent/HANDOFF.md
 .agent/runtime/
 *.png
 !public/**/*.png
+data/

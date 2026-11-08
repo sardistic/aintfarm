@@ -1,7 +1,7 @@
 FROM node:20-alpine
 WORKDIR /app
-ENV NODE_ENV=production PORT=3000
-COPY package.json server.js ./
+ENV NODE_ENV=production PORT=3000 DATA_DIR=/data
+COPY package.json server.js shared-bank.js ./
 COPY public ./public
 # Make the app readable by the unprivileged runtime user regardless of the host checkout's umask.
 RUN chmod -R a+rX /app

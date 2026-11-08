@@ -1,6 +1,6 @@
-# aintfarm
+# aint farm
 
-Live at <https://aintfarm.sardistic.com>. **Field Life** (the WebGPU neural-particle world, `public/field/`) is the homepage. The original ant farm below is at `/farm`.
+**Artificial intelligence neural training farm**: an ant farm for AI. Live at <https://aintfarm.sardistic.com>. The WebGPU neural-particle world (`public/field/`) is the homepage, and every visitor's GPU contributes a strain to one shared gene bank. The original ant farm below is at `/farm`.
 
 ## Art Farm: Microbial World
 
@@ -53,6 +53,20 @@ A separate WebGPU rebuild that follows the mechanism described for the reference
 - **Bodies share energy.** A bonded particle richer than its kin deposits energy into a per-cell share slot at the kin's cell. Only that cell's occupant can collect it, and 10% of unclaimed share leaks back into the energy channel each step, so energy is conserved.
 - **Presets and switches.** *Membranes* raises pressure and cohesion and biases founders toward isoline and bond genes. *Soup* turns surface tension off. The *learning* checkbox turns within-life learning on or off for everyone. `?off=bond,inject` disables effect types for A/B runs. With `timestamp-query`, the panel shows GPU simulation time per step.
 - **Learning within a lifetime.** A learning-rate gene (about half of founders start at 0) turns on a reward-modulated Hebbian update of the hidden→output weights every other step. The reward is the energy change against the particle's running average. Learned weights are written into the genome, so offspring inherit them (Lamarckian).
+- **Shared across visitors.** `server.js` (via `shared-bank.js`) keeps one gene bank for everyone, persisted to `$DATA_DIR/bank.json`. Browsers download it on load and every 60 s, and upload their reproducing niches every 45 s.
+  - Uploads are validated against the GPU genome format (`public/field/genebank.js`, shared by browser and server), capped (16 per post, fitness ≤ 64), and rate-limited (one per address per 20 s).
+  - Stored fitness decays with a 6-hour half-life, so stale or inflated claims get displaced.
+- **Your strain.** Each browser gets a permanent visitor id. From it come a strain tag carried in every descendant's lineage gene, a hue, and a 5×5 thumbprint.
+  - **Founding:** a new strain is founded from the fittest known genome, re-tagged, so it starts viable. About 40% of founders in your dish are your strain.
+  - **Champion:** your strain is your GPU's champion. When your dish evolves a net that out-reproduces the strain's best, it takes over the tag, so the strain keeps advancing in generation the longer you run. It resumes there on your next visit.
+- **GPU commit and score.** WebGPU exposes only the GPU's vendor and architecture, not the model, so throughput is measured instead. The *GPU commit* slider runs the simulation on that share of frames.
+  - **Score:** the particle-steps your GPU simulates are your strain's score. The server credits them, capped at what one browser could do in the elapsed time.
+  - **Ranking:** the score sets the leaderboard and weights immigration, so strains with more GPU work behind them spread into other visitors' dishes more often.
+- **Nodes and the world map.** Every strain has one node, the spot where it enters every dish. It is random until you place it with the *node* tool. All dishes share one coordinate system, so immigrants arrive at their strain's node. The world map and in-dish markers show every strain's node.
+- **Inspector.** Click a particle to read back its genome, state, and the field cells it senses. Its net's forward pass is recomputed in the browser and drawn live: 33 senses → hidden layer → outputs and effect gates.
+- **Shapes.** A particle's body shows its dominant effect gene, and moving particles stretch along their velocity. Comets are movers, rings are bonders, diamonds anchor or shield, stars swap genes, dashes build edges, and cells with a nucleus are learners. There is also a *dots* option.
+- **Edge-seeking effect.** A particle can climb the gradient magnitude of a channel, so it settles on blob boundaries. The *membranes* preset seeds founders with edge plus bond genes.
+- **Fits any GPU.** The particle count starts from a device guess, halves itself and reloads if the frame rate is poor, and remembers what fit. Browsers without WebGPU get an explainer with a preview image and a link to the ant farm.
 - **Gene bank (vector database of evolved nets).** Every second, 64 random slots are copied from the GPU. Genomes that have reproduced are embedded as a 49-dim vector of chemistry, effect loadings, architecture and range, and an 8-dim random-projection fingerprint of the weights.
   - **Niches.** A genome within the niche radius of an existing entry replaces it only if it's fitter (more offspring, plus age). Otherwise it becomes a new niche. When the bank is full (400), the weaker member of the closest pair is dropped and the radius grows.
   - **Map and planting.** The map is a live PCA of the bank. Click a dot to see that species' effects, diet, and net size, then plant it with the plant tool. *Immigration* plants a random niche every 15 s to counter monocultures, and archived species also reseed a collapsed dish.

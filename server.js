@@ -2,8 +2,13 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, normalize, relative } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { createSharedBank } from './shared-bank.js';
 
 const root = join(process.cwd(), 'public');
+const sharedBank = createSharedBank({ dataDir: process.env.DATA_DIR || join(process.cwd(), 'data') });
+await sharedBank.load();
+for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, async () => { await sharedBank.save(); process.exit(0); });
+
 const types = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png' };
 const questions = {
   chambers: { type: 'noul', instructions: 'Does `artwork` show more than one distinct underground chamber?' },
@@ -39,6 +44,26 @@ async function critique(req, res) {
   } catch (error) { return send(res, 502, { error: error.message }); }
 }
 
+async function bankApi(req, res, url) {
+  if (req.method === 'GET') {
+    const since = Math.max(0, Number(url.searchParams.get('since')) || 0);
+    return send(res, 200, sharedBank.list(since, url.searchParams.get('sid'), url.searchParams.get('strain')));
+  }
+  if (req.method !== 'POST') return send(res, 405, { error: 'Method not allowed.' });
+  if (!/^application\/json/.test(req.headers['content-type'] || '')) return send(res, 415, { error: 'Send JSON.' });
+  let body = '';
+  for await (const chunk of req) {
+    body += chunk;
+    if (body.length > sharedBank.BODY_LIMIT) return send(res, 413, { error: 'Too large.' });
+  }
+  let parsed;
+  try { parsed = JSON.parse(body); } catch { return send(res, 400, { error: 'Invalid JSON.' }); }
+  // Behind Cloudflare the client address is in CF-Connecting-IP; locally fall back to the socket.
+  const ip = String(req.headers['cf-connecting-ip'] || req.socket.remoteAddress || 'unknown');
+  const out = sharedBank.accept(parsed, ip);
+  return send(res, out.status, out.body);
+}
+
 function send(res, status, data) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
   res.end(JSON.stringify(data));
@@ -47,6 +72,8 @@ function send(res, status, data) {
 const server = createServer(async (req, res) => {
   if (req.url === '/api/critique' && req.method === 'POST') return critique(req, res);
   if (req.url === '/healthz') return send(res, 200, { ok: true });
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  if (url.pathname === '/api/bank') return bankApi(req, res, url);
   if (req.url === '/api/status' && req.method === 'GET') return send(res, 200, { jevConfigured: Boolean(process.env.TYPESAFE_API_KEY) });
   if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, { error: 'Method not allowed.' });
   const pathname = decodeURIComponent((req.url ?? '/').split('?')[0]);

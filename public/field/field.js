@@ -3,25 +3,16 @@
 // (F evolvable channels + a density channel). All simulation state lives on the GPU (WebGPU compute).
 // A CPU-side gene bank archives evolved genomes as phenotype vectors (nearest-neighbour niches).
 
+import { EFFECTS, layout, makeGenomeTools, asF32, genomeToB64, b64ToGenome, strainTagOf, strainHue, makeFounder } from './genebank.js';
+
 const qs = new URLSearchParams(location.search);
 const F = clampInt(qs.get('f'), 4, 16, 8);          // evolvable field channels (ch0 = energy)
 const HMAX = clampInt(qs.get('h'), 2, 32, 12);      // max hidden width (actual width is a gene)
 const G = clampInt(qs.get('g'), 128, 2048, 768);    // field grid size
-const N_REQ = clampInt(qs.get('n'), 1024, 2_000_000, 262144);
+const N_FIXED = qs.has('n') ? clampInt(qs.get('n'), 1024, 2_000_000, 262144) : 0;   // explicit size disables auto-fit
 const SOURCES = 12;
-const FS = F + 1;                // sensed channels: F evolvable + density
-const FX = F + 3;                // field stride: + occupant id (gene transfer, bonding) + kin energy share slot
-const KE = 4;                    // effect-gene slots per particle
-const EFFECTS = ['none', 'taxis', 'swirl', 'isoline', 'catalyse', 'jet', 'anchor', 'pressure', 'pulse', 'siphon', 'relay', 'heat', 'shield', 'drift', 'uptake', 'inject', 'bond'];
-const NT = EFFECTS.length;
-const NI = 3 * FS + 6;           // value+gradx+grady per channel (incl. density), energy, vel.xy, mem.xy, clock
-const NO = 6 + F + KE;           // split, share, write gate, write amt, aim[F], mem[2], effect gates[KE]
-const P = NI * HMAX + HMAX + HMAX * NO + NO;
-const HDR = 10;                  // H, range, mutRate, hue, lineage, generation, maxAge, clockFreq, learning rate, bond key
-const EOFF = HDR + 3 * F;        // chemistry: absorb[F], energy gain[F], push[F]
-const WOFF = EOFF + 4 * KE;      // effects: (type|chanA<<8|chanB<<16, p0, p1, p2) × KE
-const WWORDS = Math.ceil(P / 2); // weights as packed f16 pairs
-const GS = WOFF + WWORDS;        // u32 words per genome
+const L = layout(F, HMAX);
+const { FS, FX, KE, NT, NI, NO, P, HDR, EOFF, WOFF, WWORDS, GS } = L;
 const GATHER_K = 64;             // genomes sampled per gene-bank pass
 const PLANT_MAX = 600;
 const PBYTES = 48;               // Particle struct size
@@ -29,6 +20,10 @@ if ((NI * HMAX + HMAX) % 2 || NO % 2) throw new Error('plasticity expects W2 and
 
 function clampInt(v, lo, hi, d) { const n = parseInt(v, 10); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : d; }
 const $ = id => document.getElementById(id);
+function noWebGPU() {
+  document.body.classList.add('nogpu');
+  $('nogpu').hidden = false;
+}
 function fail(msg) { console.error(msg); const e = $('err'); e.textContent = msg; e.style.display = 'grid'; }
 
 const common = (N) => /* wgsl */`
@@ -80,7 +75,7 @@ struct U {
   mouse: vec2f, mouseR: f32, paramCost: f32,
   mutScale: f32, pressure: f32, plantCount: u32, plantR: f32,
   plantPos: vec2f, cohesion: f32, learnOn: u32,
-  effectMask: u32, founderBias: u32, pad2: u32, pad3: u32,
+  effectMask: u32, founderBias: u32, myStrain: u32, strainFrac: f32,
   src: array<vec4f, ${SOURCES}>,
 };
 @group(0) @binding(0) var<uniform> u: U;
@@ -122,6 +117,9 @@ fn activeParams(h: u32) -> u32 { return NI * h + h + h * NO + NO; }
 fn stepSeed(salt: u32) -> u32 { return pcg(atomicLoad(&counters[8]) * 2654435761u + salt); }
 fn packEffect(t: u32, a: u32, b: u32) -> u32 { return t | (a << 8u) | (b << 16u); }
 // who occupied this cell last step (slot + 1, 0 = nobody); written via atomicMax, carried in the field's last slot
+fn gradMag(c: u32, x: i32, y: i32) -> f32 {   // |∇| of channel c at a cell (L1, central differences)
+  return abs(field[cellIdx(x + 1, y) * FX + c] - field[cellIdx(x - 1, y) * FX + c]) + abs(field[cellIdx(x, y + 1) * FX + c] - field[cellIdx(x, y - 1) * FX + c]);
+}
 fn occupant(cell: u32) -> u32 { return bitcast<u32>(field[cell * FX + FS]); }
 fn copyEffect(srcSlot: u32, srcGene: u32, dstSlot: u32, dstGene: u32) {
   for (var w = 0u; w < 4u; w++) { sw(dstSlot, EOFF + dstGene * 4u + w, gw(srcSlot, EOFF + srcGene * 4u + w)); }
@@ -138,6 +136,7 @@ fn reset() {
   atomicStore(&counters[13], 0u);
   atomicStore(&counters[14], 0u);
   atomicStore(&counters[15], 0u);
+  atomicStore(&counters[10], 0u);
   for (var t = 0u; t < NT; t++) { atomicStore(&counters[16u + t], 0u); }
   atomicAdd(&counters[8], 1u);
 }
@@ -160,7 +159,7 @@ fn randomGenome(b: u32, lineage: u32) {
   }
   for (var s = 0u; s < KE; s++) {
     var t = select(0u, 1u + min(u32(rnd() * f32(NT - 1u)), NT - 2u), rnd() < 0.5);
-    if (u.founderBias == 1u && s < 2u && rnd() < 0.7) { t = select(16u, 3u, s == 0u); }   // membrane founders: isoline + bond
+    if (u.founderBias == 1u && s < 2u && rnd() < 0.7) { t = select(16u, 17u, s == 0u); }   // membrane founders: edge-seeking + bond
     sw(b, EOFF + s * 4u, packEffect(t, min(u32(rnd() * f32(FS)), F), min(u32(rnd() * f32(F)), F - 1u)));
     sf(b, EOFF + s * 4u + 1u, rndn() * 0.6);
     sf(b, EOFF + s * 4u + 2u, rnd());
@@ -192,7 +191,12 @@ fn seed(@builtin(global_invocation_id) gid: vec3u) {
   if (parts[i].alive == 1u) { return; }
   rs = stepSeed(i * 3u + 17u);
   if (rnd() >= u.seedProb) { return; }
-  randomGenome(i, pcg(i + atomicAdd(&counters[9], 1u) * 977u));
+  if (rnd() < u.strainFrac) {                    // this visitor's strain: mutated copies of their thumbprint genome
+    for (var w = 0u; w < GS; w++) { sw(i, w, uploadWord(w)); }
+    mutateCopy(i, i);
+  } else {
+    randomGenome(i, pcg(i + atomicAdd(&counters[9], 1u) * 977u));
+  }
   var p = newParticle(vec2f(rnd(), rnd()) * GF, 1.0);
   p.age = rnd() * 100.0;
   parts[i] = p;
@@ -390,6 +394,10 @@ fn step(@builtin(global_invocation_id) gid: vec3u) {
         }
         if (bonded) { atomicAdd(&counters[13], 1u); }
       }
+      case 17u: {                                                             // edge: climb the steepness of channel a -> settle on boundaries
+        let ge = vec2f(gradMag(ca, x + r, y) - gradMag(ca, x - r, y), gradMag(ca, x, y + r) - gradMag(ca, x, y - r));
+        force += p0 * gate * ge / (length(ge) + 0.005);
+      }
       default: {}
     }
   }
@@ -474,10 +482,10 @@ fn step(@builtin(global_invocation_id) gid: vec3u) {
   atomicMax(&deposit[nc * FX + FS], i32(i + 1u));
 }
 
-var<workgroup> wsum: array<atomic<u32>, ${5 + NT}>;
+var<workgroup> wsum: array<atomic<u32>, ${6 + NT}>;
 @compute @workgroup_size(128)
 fn collect(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_index) li: u32) {
-  if (li < ${5 + NT}u) { atomicStore(&wsum[li], 0u); }
+  if (li < ${6 + NT}u) { atomicStore(&wsum[li], 0u); }
   workgroupBarrier();
   let i = gid.x;
   if (i < N) {
@@ -491,9 +499,10 @@ fn collect(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_
       atomicAdd(&wsum[2], h);
       atomicMax(&wsum[3], gw(i, 5u));
       if (gf(i, 8u) > 0.0005) { atomicAdd(&wsum[4], 1u); }
+      if (gw(i, 4u) == u.myStrain) { atomicAdd(&wsum[5], 1u); }
       for (var s = 0u; s < KE; s++) {
         let t = min(gw(i, EOFF + s * 4u) & 255u, NT - 1u);
-        atomicAdd(&wsum[5u + t], 1u);
+        atomicAdd(&wsum[6u + t], 1u);
       }
     }
   }
@@ -504,8 +513,9 @@ fn collect(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_
     atomicAdd(&counters[6], atomicLoad(&wsum[2]));
     atomicMax(&counters[7], atomicLoad(&wsum[3]));
     atomicAdd(&counters[14], atomicLoad(&wsum[4]));
+    atomicAdd(&counters[10], atomicLoad(&wsum[5]));
   }
-  if (li >= 5u && li < ${5 + NT}u) { atomicAdd(&counters[11u + li], atomicLoad(&wsum[li])); }
+  if (li >= 6u && li < ${6 + NT}u) { atomicAdd(&counters[10u + li], atomicLoad(&wsum[li])); }
 }
 
 // Copies genome sb into db with mutation. Works in place (sb == db) since each word is read before written.
@@ -521,7 +531,7 @@ fn mutateCopy(sb: u32, db: u32) {
   sf(db, 2u, mr);
   var hue = gf(sb, 3u) + rndn() * 0.015 * u.mutScale;
   var lineage = gw(sb, 4u);
-  if (rnd() < 0.002 * u.mutScale) { hue = rnd(); lineage = pcg(lineage + 1u); } // occasional big jump
+  if (rnd() < 0.002 * u.mutScale) { hue = rnd(); }   // occasional colour jump; the lineage word (strain tag) is strictly inherited
   sf(db, 3u, fract(hue + 1.0));
   sw(db, 4u, lineage);
   sw(db, 5u, gw(sb, 5u) + 1u);
@@ -651,7 +661,7 @@ fn fieldStep(@builtin(global_invocation_id) gid: vec3u) {
 `;
 
 const renderSrc = (N) => common(N) + /* wgsl */`
-struct Cam { center: vec2f, scale: f32, mode: u32, screen: vec2f, pSize: f32, gain: f32 };
+struct Cam { center: vec2f, scale: f32, mode: u32, screen: vec2f, pSize: f32, gain: f32, myStrain: u32, highlight: u32, style: u32, pad: u32 };
 @group(0) @binding(0) var<uniform> cam: Cam;
 @group(0) @binding(1) var<storage, read> parts: array<Particle>;
 @group(0) @binding(2) var<storage, read> genome: array<u32>;
@@ -689,7 +699,21 @@ fn fval(cell: u32, c: u32) -> f32 { return field[cell * FX + c]; }
   return vec4f(col, 1.0);
 }
 
-struct VO { @builtin(position) pos: vec4f, @location(0) col: vec3f, @location(1) uv: vec2f };
+struct VO { @builtin(position) pos: vec4f, @location(0) col: vec3f, @location(1) uv: vec2f, @location(2) @interpolate(flat) shape: u32 };
+// body plan from the dominant effect gene: 0 blob, 1 comet (movers), 2 ring (bonders), 3 diamond (anchor/shield),
+// 4 star (gene uptake/injection), 5 cell with nucleus (learners), 6 dash (edge/isoline membrane builders)
+fn shapeOf(t: u32, learner: bool) -> u32 {
+  var r = select(0u, 5u, learner);
+  switch t {
+    case 1u, 2u, 5u, 13u: { r = 1u; }
+    case 16u: { r = 2u; }
+    case 6u, 12u: { r = 3u; }
+    case 14u, 15u: { r = 4u; }
+    case 3u, 17u: { r = 6u; }
+    default: {}
+  }
+  return r;
+}
 @vertex fn vsP(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VO {
   var o: VO;
   let p = parts[ii];
@@ -697,9 +721,27 @@ struct VO { @builtin(position) pos: vec4f, @location(0) col: vec3f, @location(1)
   var corners = array<vec2f, 6>(vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0),
                                 vec2f(-1.0, 1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0));
   let cn = corners[vi];
+  // dominant effect gene -> body plan; moving particles stretch along their velocity
+  var domT = 0u; var domW = 0.0;
+  for (var k = 0u; k < KE; k++) {
+    let t = genome[(EOFF + k * 4u) * N + ii] & 255u;
+    let w = abs(bitcast<f32>(genome[(EOFF + k * 4u + 1u) * N + ii]));
+    if (t > 0u && w > domW) { domW = w; domT = t; }
+  }
+  var shape = shapeOf(domT, bitcast<f32>(genome[8u * N + ii]) > 0.0005);
+  let sp = length(p.vel);
+  var dir = select(vec2f(1.0, 0.0), p.vel / max(sp, 1e-4), sp > 1e-3);
+  var stretch = 1.0 + min(sp * 1.2, 0.8);
+  var size = cam.pSize;
+  if (cam.style == 1u) { shape = 0u; stretch = 1.0; }
+  if (shape == 1u) { stretch = 1.4 + min(sp * 3.0, 2.2); }
+  if (shape == 6u) { dir = vec2f(-dir.y, dir.x); stretch = 2.2; }
+  if (shape == 2u || shape == 5u) { size *= 1.35; stretch = 1.0; }
+  let perp = vec2f(-dir.y, dir.x);
   let d = wrapD(p.pos - cam.center);
-  let s = d * cam.scale + cn * cam.pSize;
+  let s = d * cam.scale + (dir * cn.x * stretch + perp * cn.y) * size;
   o.pos = vec4f(s.x / (cam.screen.x * 0.5), -s.y / (cam.screen.y * 0.5), 0.0, 1.0);
+  o.shape = shape;
   // colour = phenotype: chemistry genes + expressed effect types, projected to a hue; tinted by lineage
   var q = vec2f(0.0);
   for (var c = 0u; c < F; c++) {
@@ -719,162 +761,60 @@ struct VO { @builtin(position) pos: vec4f, @location(0) col: vec3f, @location(1)
   let lin = bitcast<f32>(genome[3u * N + ii]);
   let hue = fract(atan2(q.y, q.x) / 6.28318 + lin * 0.35);
   o.col = hsv(hue, clamp(0.35 + length(q) * 0.25, 0.0, 0.9), 0.25 + 0.55 * clamp(p.energy / 1.5, 0.0, 1.0));
+  if (cam.highlight == 1u) { o.col *= select(0.1, 1.5, genome[4u * N + ii] == cam.myStrain); }
   o.uv = cn;
   return o;
 }
 @fragment fn fsP(in: VO) -> @location(0) vec4f {
-  let a = 1.0 - smoothstep(0.35, 1.0, length(in.uv));
+  let q = in.uv;
+  let r = length(q);
+  var a = 0.0;
+  switch in.shape {
+    case 1u: {                                     // comet: bright head at +x, tapering tail
+      let t = (q.x + 1.0) * 0.5;
+      let w = mix(0.1, 0.95, t * t);
+      a = (1.0 - smoothstep(w * 0.5, w, abs(q.y))) * (1.0 - smoothstep(0.8, 1.0, q.x)) * smoothstep(-1.0, -0.3, q.x);
+    }
+    case 2u: { a = 1.0 - smoothstep(0.1, 0.26, abs(r - 0.66)); }                     // ring
+    case 3u: { a = 1.0 - smoothstep(0.5, 0.95, abs(q.x) + abs(q.y)); }               // diamond
+    case 4u: {                                     // star / cross
+      let m = min(abs(q.x), abs(q.y));
+      a = max((1.0 - smoothstep(0.08, 0.28, m)) * (1.0 - smoothstep(0.6, 1.0, r)), 1.0 - smoothstep(0.1, 0.32, r));
+    }
+    case 5u: {                                     // cell: membrane, faint cytoplasm, nucleus
+      a = max(0.9 * (1.0 - smoothstep(0.07, 0.2, abs(r - 0.72))), 1.0 - smoothstep(0.16, 0.32, r)) + 0.15 * (1.0 - smoothstep(0.62, 0.72, r));
+    }
+    case 6u: { a = (1.0 - smoothstep(0.2, 0.6, abs(q.y))) * (1.0 - smoothstep(0.65, 1.0, abs(q.x))); }   // dash
+    default: { a = 1.0 - smoothstep(0.35, 1.0, r); }
+  }
+  a = clamp(a, 0.0, 1.0);
   return vec4f(in.col * a, a);
 }
 `;
 
-// ---------------------------------------------------------------------------------------------
-// Gene bank: an archive of evolved genomes, indexed by a phenotype embedding (nearest-neighbour niches).
-// ---------------------------------------------------------------------------------------------
-const f16buf = new DataView(new ArrayBuffer(4));
-function f16(h) {
-  const s = (h & 0x8000) ? -1 : 1, e = (h >> 10) & 31, m = h & 1023;
-  if (e === 0) return s * m * 2 ** -24;
-  if (e === 31) return m ? 0 : s * 65504;
-  return s * (1 + m / 1024) * 2 ** (e - 15);
-}
-function asF32(u) { f16buf.setUint32(0, u, true); return f16buf.getFloat32(0, true); }
-
-// Fixed random ±1 projections of the weight vector: a cheap fingerprint of the net itself.
-const PROJ_D = 8;
-const projSigns = (() => {
-  let s = 0x9e3779b9; const out = new Int8Array(PROJ_D * P);
-  for (let i = 0; i < out.length; i++) { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; out[i] = (s & 1) ? 1 : -1; }
-  return out;
-})();
-
-function decodeGenome(g) {
-  const H = Math.min(g[0], HMAX);
-  const chem = { absorb: [], egain: [], push: [] };
-  for (let c = 0; c < F; c++) {
-    chem.absorb.push(asF32(g[HDR + c])); chem.egain.push(asF32(g[HDR + F + c])); chem.push.push(asF32(g[HDR + 2 * F + c]));
-  }
-  const effects = [];
-  for (let s = 0; s < KE; s++) {
-    const tw = g[EOFF + s * 4];
-    effects.push({ t: Math.min(tw & 255, NT - 1), a: (tw >> 8) & 255, b: (tw >> 16) & 255,
-      p0: asF32(g[EOFF + s * 4 + 1]), p1: asF32(g[EOFF + s * 4 + 2]) });
-  }
-  return { H, params: NI * H + H + H * NO + NO, range: asF32(g[1]), mut: asF32(g[2]), hue: asF32(g[3]),
-    lineage: g[4] >>> 0, gen: g[5], maxAge: asF32(g[6]), clock: asF32(g[7]), eta: asF32(g[8]), key: g[9] >>> 0, chem, effects };
-}
-
-function embed(g, d) {
-  const v = [];
-  for (let c = 0; c < F; c++) v.push(d.chem.egain[c], d.chem.push[c] * 0.25, d.chem.absorb[c] * 4);
-  const eff = new Array(NT).fill(0);
-  for (const e of d.effects) if (e.t > 0) eff[e.t] += Math.min(Math.abs(e.p0), 1.5);
-  v.push(...eff.slice(1).map(x => x * 0.8));
-  v.push(d.range / 10, d.H / HMAX, Math.min(d.clock, 1), Math.min(d.eta * 20, 2));
-  const w = new Float32Array(P);
-  for (let k = 0; k < WWORDS; k++) { const u = g[WOFF + k]; w[2 * k] = f16(u & 0xffff); if (2 * k + 1 < P) w[2 * k + 1] = f16(u >>> 16); }
-  const norm = 1 / Math.sqrt(P);
-  for (let j = 0; j < PROJ_D; j++) {
-    let s = 0; const o = j * P;
-    for (let k = 0; k < P; k++) s += w[k] * projSigns[o + k];
-    v.push(Math.tanh(s * norm * 0.5));
-  }
-  return Float32Array.from(v);
-}
-
-function phenoColor(d) {
-  let qx = 0, qy = 0;
-  for (let c = 0; c < F; c++) {
-    const a = c * 2.39996;
-    qx += Math.cos(a) * d.chem.egain[c] - Math.sin(a) * d.chem.push[c] * 0.35;
-    qy += Math.sin(a) * d.chem.egain[c] + Math.cos(a) * d.chem.push[c] * 0.35;
-  }
-  for (const e of d.effects) if (e.t > 0) { const a = e.t * 0.897, m = Math.min(Math.abs(e.p0), 1) * 0.6; qx += Math.cos(a) * m; qy += Math.sin(a) * m; }
-  const hue = (((Math.atan2(qy, qx) / 6.28318 + d.hue * 0.35) % 1) + 1) % 1;
-  return `hsl(${(hue * 360).toFixed(0)} 80% 62%)`;
-}
-
-class GeneBank {
-  constructor(cap = 400) { this.cap = cap; this.entries = []; this.radius = 0.6; this.inserts = 0; this.replaced = 0; this.nextId = 1; }
-  dist(a, b) { let s = 0; for (let i = 0; i < a.length; i++) { const d = a[i] - b[i]; s += d * d; } return Math.sqrt(s); }
-  nearest(v) {
-    let best = -1, bd = Infinity;
-    this.entries.forEach((e, i) => { const d = this.dist(v, e.vec); if (d < bd) { bd = d; best = i; } });
-    return [best, bd];
-  }
-  add(genome, meta) {
-    const dec = decodeGenome(genome);
-    const vec = embed(genome, dec);
-    const fitness = meta.kids + meta.age / 2000;
-    const [i, d] = this.nearest(vec);
-    this.inserts++;
-    if (i >= 0 && d < this.radius) {
-      if (fitness > this.entries[i].fitness) {
-        Object.assign(this.entries[i], { genome, dec, vec, fitness, kids: meta.kids, color: phenoColor(dec), t: Date.now() });
-        this.replaced++;
-      }
-      return;
-    }
-    this.entries.push({ id: this.nextId++, genome, dec, vec, fitness, kids: meta.kids, color: phenoColor(dec), t: Date.now() });
-    if (this.entries.length > this.cap) this.prune();
-  }
-  prune() { // drop the weaker member of the closest pair, and widen the niche radius
-    let bi = 0, bj = 1, bd = Infinity;
-    const E = this.entries;
-    for (let i = 0; i < E.length; i++) for (let j = i + 1; j < E.length; j++) {
-      const d = this.dist(E[i].vec, E[j].vec); if (d < bd) { bd = d; bi = i; bj = j; }
-    }
-    E.splice(E[bi].fitness < E[bj].fitness ? bi : bj, 1);
-    this.radius = Math.max(this.radius, bd * 1.02);
-  }
-  pca() { // top-2 principal components by power iteration
-    const E = this.entries; if (E.length < 3) return null;
-    const D = E[0].vec.length, mean = new Float64Array(D);
-    for (const e of E) for (let i = 0; i < D; i++) mean[i] += e.vec[i] / E.length;
-    const X = E.map(e => Array.from(e.vec, (x, i) => x - mean[i]));
-    const comps = [];
-    for (let k = 0; k < 2; k++) {
-      let v = Array.from({ length: D }, (_, i) => Math.sin(i * 7.1 + k * 3.3));
-      for (let it = 0; it < 30; it++) {
-        const nv = new Array(D).fill(0);
-        for (const x of X) { let s = 0; for (let i = 0; i < D; i++) s += x[i] * v[i]; for (let i = 0; i < D; i++) nv[i] += s * x[i]; }
-        for (const c of comps) { let s = 0; for (let i = 0; i < D; i++) s += nv[i] * c[i]; for (let i = 0; i < D; i++) nv[i] -= s * c[i]; }
-        const n = Math.hypot(...nv) || 1; v = nv.map(x => x / n);
-      }
-      comps.push(v);
-    }
-    return X.map(x => comps.map(c => x.reduce((s, xi, i) => s + xi * c[i], 0)));
-  }
-  serialize() {
-    return JSON.stringify({ v: 3, F, HMAX, GS, radius: this.radius, entries: this.entries.map(e => ({
-      id: e.id, fitness: e.fitness, kids: e.kids, g: btoa(String.fromCharCode(...new Uint8Array(e.genome.buffer))) })) });
-  }
-  load(json) {
-    const o = typeof json === 'string' ? JSON.parse(json) : json;
-    if (o.F !== F || o.HMAX !== HMAX || o.GS !== GS) throw new Error(`Gene bank was saved with F=${o.F}, HMAX=${o.HMAX}; this run uses F=${F}, HMAX=${HMAX}.`);
-    this.entries = o.entries.map(e => {
-      const bytes = Uint8Array.from(atob(e.g), ch => ch.charCodeAt(0));
-      const genome = new Uint32Array(bytes.buffer);
-      const dec = decodeGenome(genome);
-      return { id: e.id, genome, dec, vec: embed(genome, dec), fitness: e.fitness, kids: e.kids, color: phenoColor(dec), t: Date.now() };
-    });
-    this.radius = o.radius || 0.6;
-    this.nextId = Math.max(1, ...this.entries.map(e => e.id + 1));
-  }
-}
+// Gene bank, genome decoding and embedding live in genebank.js, shared with the server.
+const { decodeGenome, validateGenome, embed, phenoColor, weights, GeneBank } = makeGenomeTools(L);
 
 async function main() {
-  if (!navigator.gpu) return fail('WebGPU is not available in this browser.\nUse a recent Chrome or Edge with hardware acceleration enabled.');
+  if (!navigator.gpu) return noWebGPU();
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) return fail('No WebGPU adapter found.');
   const lim = adapter.limits;
   const maxBind = Math.min(lim.maxStorageBufferBindingSize, lim.maxBufferSize);
+  // Auto-fit: start from a device guess (or what fit last time), then halve and reload if frame rate is poor.
+  const ainfo0 = adapter.info || {};
+  const guess = ainfo0.isFallbackAdapter ? 16384 : (matchMedia('(pointer: coarse)').matches && innerWidth < 900 ? 65536 : 262144);
+  let stored = 0; try { stored = parseInt(localStorage.getItem('fieldlife-n'), 10) || 0; } catch {}
+  const N_GUESS = guess;
+  const N_REQ = N_FIXED || Math.min(guess, stored || guess);
   let N = Math.min(N_REQ, Math.floor(maxBind / (GS * 4)));
   N = Math.floor(N / 128) * 128;
   if (G * G * FX * 4 > maxBind) return fail(`Field ${G}×${G}×${FX} exceeds this GPU's buffer limit.`);
   const ainfo = adapter.info || {};
   console.log('adapter', ainfo.vendor, ainfo.architecture, ainfo.description, 'N', N, 'GS', GS, 'P', P);
   const hasTS = adapter.features.has('timestamp-query');
+  // WebGPU only exposes vendor/architecture (browsers hide the exact model); throughput is measured instead
+  const gpuLabel = [ainfo0.vendor, ainfo0.architecture].filter(Boolean).join(' ') || 'unknown GPU';
   const device = await adapter.requestDevice({
     requiredFeatures: hasTS ? ['timestamp-query'] : [],
     requiredLimits: {
@@ -903,8 +843,8 @@ async function main() {
   const buf = (size, usage) => device.createBuffer({ size, usage });
   const UBYTES = 80 + SOURCES * 16;
   const uni = buf(UBYTES, GPUBufferUsage.UNIFORM | CD);
-  const camBuf = buf(32, GPUBufferUsage.UNIFORM | CD);
-  const parts = buf(N * PBYTES, S | CD);
+  const camBuf = buf(48, GPUBufferUsage.UNIFORM | CD);
+  const parts = buf(N * PBYTES, S | CD | CS);
   const genome = buf(N * GS * 4, S | CD);
   const fieldBufs = [buf(G * G * FX * 4, S | CD | CS), buf(G * G * FX * 4, S | CD | CS)];
   const deposit = buf(G * G * FX * 4, S | CD);
@@ -917,6 +857,10 @@ async function main() {
   let tsPending = false, simMs = 0;
   const staging = buf(192, GPUBufferUsage.MAP_READ | CD);
   const GATHER_BYTES = GATHER_K * (GS + 4) * 4;
+  const PICK_R = 3, PICK_W = 2 * PICK_R + 1, PICK_BYTES = PICK_W * PICK_W * FX * 4;
+  const pickRead = buf(PICK_BYTES, GPUBufferUsage.MAP_READ | CD);
+  const PROBE_G = (GS + 4) * 4, PROBE_P = PROBE_G, PROBE_F = PROBE_P + PBYTES, PROBE_BYTES = PROBE_F + 5 * FX * 4;
+  const probeRead = buf(PROBE_BYTES, GPUBufferUsage.MAP_READ | CD);
   const gatherRead = buf(GATHER_BYTES, GPUBufferUsage.MAP_READ | CD);
 
   const ST = { type: 'storage' }, RO = { type: 'read-only-storage' };
@@ -960,7 +904,7 @@ async function main() {
 
   // ---------- host state ----------
   const ui = {};
-  for (const id of ['sun', 'metab', 'pcost', 'mut', 'pressure', 'cohesion', 'spf', 'brush', 'fgain']) {
+  for (const id of ['sun', 'metab', 'pcost', 'mut', 'pressure', 'cohesion', 'spf', 'brush', 'fgain', 'commit']) {
     const el = $(id), out = el.nextElementSibling;
     if (qs.get(id)) el.value = qs.get(id);
     const sync = () => { ui[id] = parseFloat(el.value); out.textContent = fmtSlider(id, ui[id]); };
@@ -969,17 +913,92 @@ async function main() {
   function fmtSlider(id, v) {
     if (id === 'metab') return (v * 1000).toFixed(1) + 'e-3';
     if (id === 'pcost') return (v * 1e6).toFixed(1) + 'e-6';
+    if (id === 'commit') return v + '%';
     return String(v);
   }
   let mode = clampInt(qs.get('mode'), 0, 4, 0), paused = false, cur = 0, seedProb = 0.35, frameNo = 0;
   let tool = 'erase';
   const cam = { cx: G / 2, cy: G / 2, scale: 1 };
   const mouse = { x: 0, y: 0, down: false, panning: false, lx: 0, ly: 0 };
-  const stats = { alive: 0, births: 0, deaths: 0, params: 0, hidden: 0, gen: 0, uptakes: 0, injections: 0, bonded: 0, learners: 0, shared: 0, effects: new Array(NT).fill(0), pending: false };
+  const stats = { mine: 0, alive: 0, births: 0, deaths: 0, params: 0, hidden: 0, gen: 0, uptakes: 0, injections: 0, bonded: 0, learners: 0, shared: 0, effects: new Array(NT).fill(0), pending: false };
+  let commitAcc = 0;
   let stepsDone = 0, stepRate = 0, fps = 0, rateT = performance.now(), rateSteps = 0, rateFrames = 0;
   const bank = new GeneBank();
-  const BANK_KEY = `fieldlife-bank-v3-F${F}-H${HMAX}`;
+  const BANK_KEY = `fieldlife-bank-v4-F${F}-H${HMAX}`;
   try { const saved = localStorage.getItem(BANK_KEY); if (saved && !qs.has('fresh')) bank.load(saved); } catch (e) { console.warn('gene bank not restored', e); }
+  // ---- your strain: a stable thumbprint per browser ----
+  let visitorId = '';
+  try { visitorId = localStorage.getItem('fieldlife-visitor') || ''; } catch {}
+  if (!/^[0-9a-f]{32}$/.test(visitorId)) {
+    visitorId = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
+    try { localStorage.setItem('fieldlife-visitor', visitorId); } catch {}
+  }
+  const strainTag = strainTagOf(visitorId);
+  const strainHex = strainTag.toString(16).padStart(8, '0');
+  const STRAIN_KEY = `fieldlife-strain-v1-F${F}-H${HMAX}`;
+  let strainBest = { g: makeFounder(L, strainTag), score: -1, gen: 0 };
+  try {
+    const st = JSON.parse(localStorage.getItem(STRAIN_KEY) || 'null');
+    const g = st && b64ToGenome(st.g);
+    if (g && !validateGenome(g) && (g[4] >>> 0) === strainTag) strainBest = { g, score: st.score || 0, gen: g[5] };
+  } catch {}
+  // Your strain is your GPU's champion: the most successful net your dish has produced (offspring, age, generation).
+  // When a better one appears it takes over your thumbprint (lineage tag + hue), so the strain keeps advancing while you run.
+  // `local` marks genomes sampled from your own dish; shared-bank genomes only count if they already carry your tag.
+  let championChanges = 0;
+  function considerOwn(g, fitness, local = false) {
+    const own = (g[4] >>> 0) === strainTag;
+    if ((!own && !local) || validateGenome(g)) return;
+    const score = fitness + g[5] * 0.05;
+    if (score <= strainBest.score) return;
+    const t = Uint32Array.from(g);
+    t[4] = strainTag;
+    const dv = new DataView(new ArrayBuffer(4)); dv.setFloat32(0, strainHue(strainTag), true); t[3] = dv.getUint32(0, true);
+    strainBest = { g: t, score, gen: t[5] };
+    if (!own) championChanges++;
+    try { localStorage.setItem(STRAIN_KEY, JSON.stringify({ g: genomeToB64(t), score })); } catch {}
+  }
+  for (const e of bank.entries) considerOwn(e.genome, e.fitness);
+  // A brand-new strain is founded from the fittest genome already known, re-tagged with your thumbprint,
+  // so it starts viable and diverges from there (a random founder almost always goes extinct).
+  function adoptFounder() {
+    if (strainBest.score >= 0 || !bank.entries.length) return false;
+    const best = bank.entries.reduce((a, b) => (b.fitness > a.fitness ? b : a));
+    const g = Uint32Array.from(best.genome);
+    g[4] = strainTag; g[5] = 0;
+    const dv = new DataView(new ArrayBuffer(4)); dv.setFloat32(0, strainHue(strainTag), true); g[3] = dv.getUint32(0, true);
+    strainBest = { g, score: 0, gen: 0 };
+    try { localStorage.setItem(STRAIN_KEY, JSON.stringify({ g: genomeToB64(g), score: 0 })); } catch {}
+    return true;
+  }
+  adoptFounder();
+  let seedStrainFrac = 0.4, lastStrainPlant = performance.now(), plantedChampion = 0;
+  const WORK_KEY = `fieldlife-work-${strainHex}`;
+  let lifeWork = 0; try { lifeWork = +(localStorage.getItem(WORK_KEY) || 0); } catch {}
+  // your node: where your strain enters every dish. Random until you choose it with the node tool.
+  let myNode = null;
+  try { myNode = JSON.parse(localStorage.getItem('fieldlife-node') || 'null'); } catch {}
+  if (!myNode || !(myNode.x >= 0 && myNode.x < 1 && myNode.y >= 0 && myNode.y < 1)) myNode = { x: Math.random(), y: Math.random(), chosen: false };
+  const saveNode = () => { try { localStorage.setItem('fieldlife-node', JSON.stringify(myNode)); } catch {} };
+  saveNode();
+  let nodeDirty = true;
+  function drawThumb(canvasEl, tag) {
+    const c = canvasEl.getContext('2d'), n = 5, w = canvasEl.width / n;
+    let bits = strainTagOf('thumb:' + tag);
+    c.clearRect(0, 0, canvasEl.width, canvasEl.height);
+    c.fillStyle = `hsl(${(strainHue(tag) * 360).toFixed(0)} 85% 60%)`;
+    for (let y = 0; y < n; y++) for (let x = 0; x < 3; x++) {
+      if ((bits >>> (y * 3 + x)) & 1) { c.fillRect(x * w, y * w, w, w); c.fillRect((n - 1 - x) * w, y * w, w, w); }
+    }
+  }
+
+  // ---- particle inspector ----
+  const insp = { slot: -1, pick: null, busy: false, last: 0, pos: [0, 0], r: 1, data: null };
+  const bootT = performance.now();
+  let fitSamples = [], fitDone = !!N_FIXED;
+  let fitNote = '';
+  try { const dn = sessionStorage.getItem('fieldlife-downsized'); if (dn) { fitNote = `fitted to ${(+dn).toLocaleString()} particles for this GPU`; sessionStorage.removeItem('fieldlife-downsized'); } } catch {}
+
   let selected = null;
   const plantQ = [];            // { genome, x, y, r, count, stage }
   let gatherPending = false, lastGather = 0, lastImmig = performance.now(), lastSave = performance.now();
@@ -1016,6 +1035,14 @@ async function main() {
     mouse.lx = e.clientX; mouse.ly = e.clientY;
     [mouse.x, mouse.y] = toWorld(e.clientX, e.clientY);
     if (e.button !== 0) { mouse.panning = true; return; }
+    if (tool === 'node') {
+      myNode = { x: (((mouse.x % G) + G) % G) / G, y: (((mouse.y % G) + G) % G) / G, chosen: true };
+      saveNode(); nodeDirty = true; lastUpload = 0;
+      queuePlant({ genome: strainBest.g }, myNode.x * G, myNode.y * G, 16, 450);
+      setTool('erase');
+      return;
+    }
+    if (tool === 'inspect') { insp.pick = [((mouse.x % G) + G) % G, ((mouse.y % G) + G) % G]; return; }
     if (tool === 'plant') {
       const sp = selected || bank.entries[Math.floor(Math.random() * bank.entries.length)];
       if (sp) { const r = brushWorld(); queuePlant(sp, mouse.x, mouse.y, r, Math.round(Math.PI * r * r * 0.6)); }
@@ -1059,19 +1086,23 @@ async function main() {
   }
   $('preset').addEventListener('change', () => applyPreset($('preset').value, true));
   if (PRESETS[qs.get('preset')]) { $('preset').value = qs.get('preset'); applyPreset(qs.get('preset'), false); }
+  if (innerWidth < 700) { $('panel').classList.add('collapsed'); $('collapse').textContent = '+'; }
   const modeSel = $('mode');
   modeSel.value = String(mode);
   modeSel.addEventListener('change', () => { mode = +modeSel.value; });
   const pauseBtn = $('pause');
   const togglePause = () => { paused = !paused; pauseBtn.textContent = paused ? 'play' : 'pause'; };
   pauseBtn.addEventListener('click', togglePause);
-  $('seed').addEventListener('click', () => { seedProb = 0.1; });
+  $('seed').addEventListener('click', () => { seedProb = 0.1; seedStrainFrac = 0; });
   $('reset').addEventListener('click', resetWorld);
   $('collapse').addEventListener('click', () => {
     const p = $('panel'); p.classList.toggle('collapsed');
     $('collapse').textContent = p.classList.contains('collapsed') ? '+' : '–';
   });
-  const setTool = t => { tool = t; $('toolErase').classList.toggle('on', t === 'erase'); $('toolPlant').classList.toggle('on', t === 'plant'); };
+  const setTool = t => { tool = t; for (const [id, n] of [['toolErase', 'erase'], ['toolPlant', 'plant'], ['toolInspect', 'inspect'], ['toolNode', 'node']]) $(id).classList.toggle('on', t === n); };
+  $('toolInspect').addEventListener('click', () => setTool('inspect'));
+  $('toolNode').addEventListener('click', () => setTool('node'));
+  $('inspClose').addEventListener('click', () => { insp.slot = -1; insp.data = null; $('inspector').hidden = true; $('ring').hidden = true; });
   $('toolErase').addEventListener('click', () => setTool('erase'));
   $('toolPlant').addEventListener('click', () => setTool('plant'));
   $('plantRandom').addEventListener('click', () => plantRandom());
@@ -1095,15 +1126,23 @@ async function main() {
     if (e.key === 'r') resetWorld();
     if (e.key === 'e') setTool('erase');
     if (e.key === 'p') setTool('plant');
+    if (e.key === 'i') setTool('inspect');
+    if (e.key === 'n') setTool('node');
   });
-  function saveBank() { try { localStorage.setItem(BANK_KEY, bank.serialize()); } catch (e) { console.warn('gene bank not saved', e); } }
+  function saveBank() {
+    try { localStorage.setItem(BANK_KEY, bank.serialize()); } catch (e) { console.warn('gene bank not saved', e); }
+    try { localStorage.setItem(WORK_KEY, String(Math.round(lifeWork))); } catch {}
+  }
   addEventListener('beforeunload', saveBank);
 
   function plantRandom() {
     if (!bank.entries.length) return;
-    // uniform over niches (not individuals), so rare strategies get re-introduced as often as common ones
-    const sp = bank.entries[Math.floor(Math.random() * bank.entries.length)];
-    queuePlant(sp, Math.random() * G, Math.random() * G, 14, 360);
+    // every niche gets a base chance; niches of strains whose visitors have contributed more GPU work get extra
+    const w = bank.entries.map(e => 1 + (strainWeight.get(e.dec.lineage) || 0));
+    let r = Math.random() * w.reduce((a, b) => a + b, 0), k = 0;
+    while (k < w.length - 1 && (r -= w[k]) > 0) k++;
+    const nd = strainNode.get(bank.entries[k].dec.lineage);   // a visitor's strain always enters at its node
+    queuePlant(bank.entries[k], nd ? nd.x * G : Math.random() * G, nd ? nd.y * G : Math.random() * G, 14, 360);
   }
 
   function resetWorld() {
@@ -1112,7 +1151,189 @@ async function main() {
     enc.clearBuffer(deposit); enc.clearBuffer(counters);
     device.queue.submit([enc.finish()]);
     seedProb = 0.35;
+    seedStrainFrac = 0.4;
     plantQ.length = 0;
+  }
+
+  // Recomputes this particle's forward pass from its genome and the field values it sensed, then draws it.
+  const OUT_LABELS = () => ['split', 'share', 'write', 'amount', ...Array.from({ length: F }, (_, c) => c ? 'aim c' + c : 'aim E'), 'mem 0', 'mem 1'];
+  function renderInspector() {
+    const D = insp.data; if (!D) return;
+    const dec = decodeGenome(D.g), w = weights(D.g), H = dec.H;
+    if (!D.alive) { $('insp').textContent = 'this particle has died. Click another one.'; insp.slot = -1; $('ring').hidden = true; return; }
+    const [here, xp, xm, yp, ym] = D.cells, r = insp.r, inv = 1 / (2 * r);
+    const inp = new Float32Array(NI);
+    for (let c = 0; c < FS; c++) {
+      const k = c === F ? 0.3 : 1;
+      inp[c] = here[c] * k; inp[FS + c] = (xp[c] - xm[c]) * inv * 8 * k; inp[2 * FS + c] = (yp[c] - ym[c]) * inv * 8 * k;
+    }
+    inp[3 * FS] = D.energy - 1; inp[3 * FS + 1] = D.vel[0] * 2; inp[3 * FS + 2] = D.vel[1] * 2;
+    inp[3 * FS + 3] = D.mem[0]; inp[3 * FS + 4] = D.mem[1]; inp[3 * FS + 5] = Math.sin(D.age * dec.clock);
+    const hid = new Float32Array(H), out = new Float32Array(NO);
+    for (let h = 0; h < H; h++) { let a = w[L.B1 + h]; for (let j = 0; j < NI; j++) a += w[j * HMAX + h] * inp[j]; hid[h] = Math.tanh(a); }
+    for (let k = 0; k < NO; k++) { let a = w[L.B2 + k]; for (let h = 0; h < H; h++) a += w[L.W2 + h * NO + k] * hid[h]; out[k] = a; }
+    const sig = x => 1 / (1 + Math.exp(-x));
+    const labels = [...OUT_LABELS(), ...dec.effects.map(e => (EFFECTS[e.t] === 'none' ? '—' : EFFECTS[e.t]))];
+    // diagram
+    const cv = $('netc'), c = cv.getContext('2d'), W = cv.width, Hh = cv.height;
+    c.fillStyle = '#050607'; c.fillRect(0, 0, W, Hh);
+    const col = v => v >= 0 ? `rgba(247,190,70,${Math.min(1, Math.abs(v))})` : `rgba(90,200,255,${Math.min(1, Math.abs(v))})`;
+    const ys = (n, i) => 10 + (Hh - 20) * (n === 1 ? 0.5 : i / (n - 1));
+    const X0 = 18, X1 = W * 0.5, X2 = W - 92;
+    c.lineWidth = 1;
+    for (let h = 0; h < H; h++) {
+      for (let j = 0; j < NI; j++) { const v = w[j * HMAX + h] * inp[j]; if (Math.abs(v) < 0.15) continue; c.strokeStyle = col(v * 0.6); c.beginPath(); c.moveTo(X0, ys(NI, j)); c.lineTo(X1, ys(H, h)); c.stroke(); }
+      for (let k = 0; k < NO; k++) { const v = w[L.W2 + h * NO + k] * hid[h]; if (Math.abs(v) < 0.15) continue; c.strokeStyle = col(v * 0.6); c.beginPath(); c.moveTo(X1, ys(H, h)); c.lineTo(X2, ys(NO, k)); c.stroke(); }
+    }
+    const dot = (x, y, v, rr) => { c.fillStyle = col(Math.tanh(v) * 0.85 + Math.sign(v) * 0.15); c.beginPath(); c.arc(x, y, rr, 0, 6.2832); c.fill(); c.strokeStyle = 'rgba(255,255,255,.25)'; c.stroke(); };
+    for (let j = 0; j < NI; j++) dot(X0, ys(NI, j), inp[j], 3);
+    for (let h = 0; h < H; h++) dot(X1, ys(H, h), hid[h], 5);
+    c.font = '10px ui-monospace, monospace'; c.textBaseline = 'middle';
+    for (let k = 0; k < NO; k++) { dot(X2, ys(NO, k), out[k], 3.5); c.fillStyle = '#9fb3a8'; c.fillText(labels[k] || '', X2 + 7, ys(NO, k)); }
+    c.fillStyle = '#7a8a80'; c.fillText(`${NI} senses`, 2, Hh - 4); c.fillText(`${H} hidden`, X1 - 22, Hh - 4);
+    // text
+    const gates = dec.effects.map((e, k) => e.t ? `${EFFECTS[e.t]} ${(100 * sig(out[6 + F + k])).toFixed(0)}%` : null).filter(Boolean);
+    const splitting = out[0] > 0 && D.energy > 0.5 && D.age > 16;
+    $('insp').textContent =
+      `slot ${insp.slot}  gen ${dec.gen}  age ${D.age.toFixed(0)}  kids ${D.kids}\n` +
+      `energy ${D.energy.toFixed(3)}  speed ${Math.hypot(...D.vel).toFixed(2)}\n` +
+      `strain ${dec.lineage.toString(16).padStart(8, '0')}${dec.lineage === strainTag ? ' (yours)' : ''}  bond ${dec.key.toString(16).padStart(8, '0')}\n` +
+      `net ${NI}→${H}→${NO}  ${dec.params} params  ${dec.eta > 0.0005 ? 'learning η ' + dec.eta.toFixed(3) : 'innate only'}\n` +
+      `now: ${splitting ? 'SPLITTING (child gets ' + (15 + 70 * sig(out[1])).toFixed(0) + '%)' : 'not splitting'} · ${out[2] > 0 ? 'writing' : 'not writing'}\n` +
+      `effect gates: ${gates.join(', ') || 'none'}`;
+  }
+  function placeRing() {
+    if (insp.slot < 0 || !insp.data) { $('ring').hidden = true; return; }
+    const dpr = canvas.width / innerWidth;
+    const wrap = d => d - Math.round(d / G) * G;
+    const sx = (wrap(insp.pos[0] - cam.cx) * cam.scale + canvas.width / 2) / dpr, sy = (wrap(insp.pos[1] - cam.cy) * cam.scale + canvas.height / 2) / dpr;
+    const ring = $('ring'); ring.hidden = false;
+    ring.style.transform = `translate(${sx - 14}px, ${sy - 14}px)`;
+  }
+
+  // ----- shared gene bank (one archive across all visitors) -----
+  const SHARED = F === 8 && HMAX === 12 && !qs.has('offline');
+  const sid = (() => {
+    const mk = () => Array.from(crypto.getRandomValues(new Uint8Array(12)), b => (b % 36).toString(36)).join('');
+    try { let v = sessionStorage.getItem('fieldlife-sid'); if (!v) { v = mk(); sessionStorage.setItem('fieldlife-sid', v); } return v; } catch { return mk(); }
+  })();
+  const strainWeight = new Map();      // lineage tag -> extra immigration weight from contributed GPU work
+  const strainNode = new Map();        // lineage tag -> {x, y} in world fractions (shared by every visitor)
+  let shared = null, sharedSince = 0, syncBusy = false, lastSync = -1e9, lastUpload = performance.now(), workPending = 0, firstImmig = true;
+  async function syncShared() {
+    if (!SHARED || syncBusy) return;
+    syncBusy = true;
+    try {
+      const r = await fetch(`/api/bank?since=${sharedSince}&sid=${sid}&strain=${strainHex}`);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const o = await r.json();
+      sharedSince = o.now;
+      shared = o;
+      strainWeight.clear();
+      strainNode.clear();
+      for (const st of o.strains || []) {
+        const tag = parseInt(st.tag, 16) >>> 0;
+        strainWeight.set(tag, Math.log10(1 + st.work / 1e7));
+        if (st.node) strainNode.set(tag, st.node);
+      }
+      for (const e of o.entries) {
+        const g = b64ToGenome(e.g);
+        if (!g || validateGenome(g)) continue;
+        const ins = bank.insert(g, e.fitness, e.kids, 'shared', e.t);
+        if (ins) ins.dirty = false;
+        considerOwn(g, e.fitness);
+      }
+      if (adoptFounder()) queuePlant({ genome: strainBest.g }, myNode.x * G, myNode.y * G, 16, 450);
+      if (firstImmig && o.entries.length >= 8 && $('immigrate').checked) { firstImmig = false; for (let k = 0; k < 3; k++) plantRandom(); }
+      drawBank();
+    } catch (e) { console.warn('shared bank sync failed', e.message); }
+    syncBusy = false;
+  }
+  async function uploadShared() {
+    if (!SHARED) return;
+    const picks = bank.entries.filter(e => e.dirty && e.origin === 'local').sort((a, b) => b.fitness - a.fitness).slice(0, 12);
+    const body = { sid, strain: strainHex, work: Math.round(workPending), F, HMAX, GS, node: nodeDirty ? myNode : undefined,
+      entries: picks.map(e => ({ g: genomeToB64(e.genome), fitness: e.fitness, kids: e.kids })) };
+    try {
+      const r = await fetch('/api/bank', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      if (r.ok) { picks.forEach(e => { e.dirty = false; }); workPending = 0; nodeDirty = false; }
+    } catch (e) { console.warn('shared bank upload failed', e.message); }
+  }
+  const fmtWork = w => w >= 1e12 ? (w / 1e12).toFixed(1) + 'T' : w >= 1e9 ? (w / 1e9).toFixed(1) + 'B' : w >= 1e6 ? (w / 1e6).toFixed(1) + 'M' : Math.round(w / 1e3) + 'k';
+  // world map: every strain's node, in the shared coordinate system all dishes use
+  function nodeList() {
+    const list = (shared?.strains || []).filter(st => st.node && st.tag !== strainHex)
+      .map(st => ({ tag: st.tag, x: st.node.x, y: st.node.y, work: st.work, online: st.online, mine: false }));
+    list.push({ tag: strainHex, x: myNode.x, y: myNode.y, work: Math.max(shared?.mine?.work || 0, lifeWork), online: true, mine: true });
+    return list;
+  }
+  const world = $('world'), wctx = world.getContext('2d');
+  function drawWorld() {
+    const W = world.width;
+    wctx.fillStyle = '#050607'; wctx.fillRect(0, 0, W, W);
+    wctx.strokeStyle = 'rgba(255,255,255,.06)'; wctx.lineWidth = 1;
+    for (let k = 1; k < 4; k++) { wctx.beginPath(); wctx.moveTo(k * W / 4, 0); wctx.lineTo(k * W / 4, W); wctx.moveTo(0, k * W / 4); wctx.lineTo(W, k * W / 4); wctx.stroke(); }
+    // current viewport
+    const vw = canvas.width / cam.scale / G * W, vh = canvas.height / cam.scale / G * W;
+    wctx.strokeStyle = 'rgba(111,227,168,.5)'; wctx.strokeRect(cam.cx / G * W - vw / 2, cam.cy / G * W - vh / 2, vw, vh);
+    for (const n of nodeList()) {
+      const x = n.x * W, y = n.y * W, r = 4 + Math.min(14, Math.log10(1 + n.work / 1e6) * 3);
+      wctx.globalAlpha = n.online ? 0.95 : 0.45;
+      wctx.fillStyle = `hsl(${(strainHue(parseInt(n.tag, 16) >>> 0) * 360).toFixed(0)} 85% 60%)`;
+      wctx.beginPath(); wctx.arc(x, y, r, 0, 6.2832); wctx.fill();
+      if (n.mine) {
+        wctx.globalAlpha = 1; wctx.strokeStyle = '#f7cf5a'; wctx.lineWidth = 3;
+        wctx.beginPath(); wctx.arc(x, y, r + 5, 0, 6.2832); wctx.stroke();
+        wctx.fillStyle = '#f7cf5a'; wctx.font = 'bold 22px ui-monospace, monospace'; wctx.fillText('you', x + r + 8, y + 7);
+      }
+    }
+    wctx.globalAlpha = 1;
+  }
+  world.addEventListener('click', e => {
+    const r = world.getBoundingClientRect();
+    cam.cx = (e.clientX - r.left) / r.width * G; cam.cy = (e.clientY - r.top) / r.height * G;
+  });
+  // markers in the dish itself
+  const nodeEls = new Map();
+  function placeNodes() {
+    const dpr = canvas.width / innerWidth, wrap = d => d - Math.round(d / G) * G, keep = new Set();
+    for (const n of nodeList()) {
+      keep.add(n.tag);
+      let el = nodeEls.get(n.tag);
+      if (!el) {
+        el = document.createElement('div'); el.className = 'node' + (n.mine ? ' mine' : '');
+        el.style.setProperty('--h', (strainHue(parseInt(n.tag, 16) >>> 0) * 360).toFixed(0));
+        const label = document.createElement('span');
+        label.textContent = n.mine ? 'your node' : n.tag.slice(0, 4) + '·' + n.tag.slice(4);
+        el.appendChild(label);
+        $('nodes').appendChild(el); nodeEls.set(n.tag, el);
+      }
+      const sx = (wrap(n.x * G - cam.cx) * cam.scale + canvas.width / 2) / dpr, sy = (wrap(n.y * G - cam.cy) * cam.scale + canvas.height / 2) / dpr;
+      el.style.transform = `translate(${sx.toFixed(1)}px, ${sy.toFixed(1)}px)`;
+      el.classList.toggle('off', !n.online);
+    }
+    for (const [tag, el] of nodeEls) if (!keep.has(tag)) { el.remove(); nodeEls.delete(tag); }
+  }
+
+  function renderStrains() {
+    drawThumb($('thumb'), strainTag);
+    const mine = shared?.mine;
+    const share = stats.alive ? (100 * stats.mine / stats.alive) : 0;
+    $('strainInfo').textContent =
+      `strain     ${strainHex.slice(0, 4)}·${strainHex.slice(4)}\n` +
+      `node       ${(myNode.x * 100).toFixed(0)},${(myNode.y * 100).toFixed(0)}${myNode.chosen ? ' (chosen)' : ' (random — use node tool)'}\n` +
+      `in dish    ${share.toFixed(1)}% (${stats.mine.toLocaleString()})\n` +
+      `advanced   gen ${Math.max(strainBest.gen, mine?.bestGen || 0)}\n` +
+      `score      ${fmtWork(Math.max(mine?.work || 0, lifeWork))} particle-steps${mine ? ' · #' + ((shared.strains || []).findIndex(s => s.tag === strainHex) + 1 || '–') + ' of ' + shared.strainCount : ''}\n` +
+      `GPU        ${gpuLabel} · ${fmtWork(stepRate * stats.alive)}/s at ${ui.commit}%`;
+    const rows = (shared?.strains || []).slice(0, 10);
+    $('strains').innerHTML = rows.length ? rows.map((st, i) => {
+      const hue = (strainHue(parseInt(st.tag, 16) >>> 0) * 360).toFixed(0);
+      const you = st.tag === strainHex ? ' <b>you</b>' : '';
+      return `<div class="srow"><span class="sw" style="background:hsl(${hue} 85% 60%)"></span>${i + 1}. ${st.tag.slice(0, 4)}·${st.tag.slice(4)}${you}` +
+        `<span class="sr">${fmtWork(st.work)} · gen ${st.bestGen} · ${st.niches}n${st.online ? ' ●' : ''}</span></div>`;
+    }).join('') : '<div class="dim">no shared strains yet</div>';
+    $('online').textContent = shared ? `${shared.online} online · ${shared.niches} shared niches · ${shared.contributors} contributors` : (SHARED ? 'connecting…' : 'offline (custom configuration)');
   }
 
   // ----- gene bank map -----
@@ -1134,6 +1355,8 @@ async function main() {
         const r = 2 + 5 * Math.sqrt(e.fitness / maxFit);
         mctx.fillStyle = e.color; mctx.globalAlpha = 0.85;
         mctx.beginPath(); mctx.arc(x, y, r, 0, 6.2832); mctx.fill();
+        if (e.dec.lineage === strainTag) { mctx.globalAlpha = 1; mctx.strokeStyle = '#f7cf5a'; mctx.lineWidth = 2; mctx.beginPath(); mctx.arc(x, y, r + 2.5, 0, 6.2832); mctx.stroke(); }
+        else if (e.origin === 'shared') { mctx.globalAlpha = 0.6; mctx.strokeStyle = '#cfe8ff'; mctx.lineWidth = 1; mctx.beginPath(); mctx.arc(x, y, r + 1.5, 0, 6.2832); mctx.stroke(); }
         if (selected && e.id === selected.id) { mctx.globalAlpha = 1; mctx.strokeStyle = '#fff'; mctx.lineWidth = 2; mctx.beginPath(); mctx.arc(x, y, r + 4, 0, 6.2832); mctx.stroke(); }
       });
       mctx.globalAlpha = 1;
@@ -1160,6 +1383,7 @@ async function main() {
     const eats = d.chem.egain.map((g, c) => [g * d.chem.absorb[c], c]).sort((a, b) => b[0] - a[0]);
     $('species').textContent =
       `#${selected.id}  gen ${d.gen}  kids ${selected.kids}  fit ${selected.fitness.toFixed(1)}\n` +
+      `strain ${d.lineage.toString(16).padStart(8, '0')}${d.lineage === strainTag ? ' (yours)' : ''} · ${selected.origin === 'shared' ? 'from the shared bank' : 'evolved here'}\n` +
       `net ${NI}→${d.H}→${NO} (${d.params} params)  range ${d.range.toFixed(1)}\n` +
       `learning ${d.eta > 0.0005 ? 'η ' + d.eta.toFixed(3) : 'innate only'}  bond key ${d.key.toString(16).padStart(8, '0')}\n` +
       `effects: ${effs.join(', ') || 'none'}\n` +
@@ -1178,7 +1402,7 @@ async function main() {
 
   const uData = new ArrayBuffer(UBYTES);
   const uF = new Float32Array(uData), uU = new Uint32Array(uData);
-  const camData = new ArrayBuffer(32);
+  const camData = new ArrayBuffer(48);
   const camF = new Float32Array(camData), camU = new Uint32Array(camData);
   const wg = Math.ceil(N / 128), fg = Math.ceil(G / 16);
 
@@ -1187,7 +1411,7 @@ async function main() {
     uF[4] = extra.mx ?? 0; uF[5] = extra.my ?? 0; uF[6] = extra.mr ?? 0; uF[7] = ui.pcost;
     uF[8] = ui.mut; uF[9] = ui.pressure; uU[10] = extra.count ?? 0; uF[11] = extra.pr ?? 0;
     uF[12] = extra.px ?? 0; uF[13] = extra.py ?? 0; uF[14] = ui.cohesion; uU[15] = $('learn').checked ? 1 : 0;
-    uU[16] = effectMask; uU[17] = founderBias;
+    uU[16] = effectMask; uU[17] = founderBias; uU[18] = strainTag; uF[19] = extra.strainFrac ?? 0;
     sources.forEach((s, k) => {
       uF[20 + k * 4] = s.x; uF[21 + k * 4] = s.y; uF[22 + k * 4] = s.sigma;
       uF[23 + k * 4] = s.base * (0.35 + 0.65 * (0.5 + 0.5 * Math.sin(s.phase)));
@@ -1208,6 +1432,58 @@ async function main() {
       pass.setBindGroup(0, cGroups[cur]); pass.setPipeline(K.plant); pass.dispatchWorkgroups(Math.ceil(p2.count / 64));
       pass.end();
       device.queue.submit([enc.finish()]);
+      return;
+    }
+    // inspector: find who is under the click (occupant ids in a small window of the field)
+    if (insp.pick && !insp.busy) {
+      const [px, py] = insp.pick; insp.pick = null; insp.busy = true;
+      const cx = Math.floor(px), cy = Math.floor(py), x0 = Math.min(Math.max(cx - PICK_R, 0), G - PICK_W);
+      const enc = device.createCommandEncoder();
+      for (let k = 0; k < PICK_W; k++) {
+        const y = (((cy - PICK_R + k) % G) + G) % G;
+        enc.copyBufferToBuffer(fieldBufs[cur], (y * G + x0) * FX * 4, pickRead, k * PICK_W * FX * 4, PICK_W * FX * 4);
+      }
+      device.queue.submit([enc.finish()]);
+      pickRead.mapAsync(GPUMapMode.READ).then(() => {
+        const u32 = new Uint32Array(pickRead.getMappedRange().slice(0)); pickRead.unmap();
+        let best = -1, bd = Infinity;
+        for (let k = 0; k < PICK_W; k++) for (let x = 0; x < PICK_W; x++) {
+          const occ = u32[(k * PICK_W + x) * FX + FS];
+          const d = (x0 + x + 0.5 - px) ** 2 + (k - PICK_R) ** 2;
+          if (occ && d < bd) { bd = d; best = occ - 1; }
+        }
+        if (best >= 0) { insp.slot = best; insp.pos = [px, py]; insp.last = 0; $('inspector').hidden = false; }
+        insp.busy = false;
+      }).catch(() => { insp.busy = false; });
+      return;
+    }
+    // inspector: read the selected particle's genome, state and the field cells it senses
+    if (insp.slot >= 0 && !insp.busy && now - insp.last > 250) {
+      insp.busy = true; insp.last = now;
+      device.queue.writeBuffer(reqs, 0, new Uint32Array([insp.slot, 0]));
+      writeUniforms({ count: 1 });
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginComputePass();
+      pass.setBindGroup(0, cGroups[cur]); pass.setPipeline(K.gather); pass.dispatchWorkgroups(Math.ceil(GS / 128));
+      pass.end();
+      enc.copyBufferToBuffer(freeList, 0, probeRead, 0, PROBE_G);
+      enc.copyBufferToBuffer(parts, insp.slot * PBYTES, probeRead, PROBE_P, PBYTES);
+      const x = Math.floor(insp.pos[0]), y = Math.floor(insp.pos[1]), r = insp.r;
+      const cellAt = (cx, cy) => (((cy % G) + G) % G) * G + (((cx % G) + G) % G);
+      [cellAt(x, y), cellAt(x + r, y), cellAt(x - r, y), cellAt(x, y + r), cellAt(x, y - r)].forEach((c, k) =>
+        enc.copyBufferToBuffer(fieldBufs[cur], c * FX * 4, probeRead, PROBE_F + k * FX * 4, FX * 4));
+      device.queue.submit([enc.finish()]);
+      probeRead.mapAsync(GPUMapMode.READ).then(() => {
+        const buf8 = probeRead.getMappedRange().slice(0); probeRead.unmap();
+        const g = new Uint32Array(buf8, 0, GS).slice();
+        const pf = new Float32Array(buf8, PROBE_P, PBYTES / 4), pu = new Uint32Array(buf8, PROBE_P, PBYTES / 4);
+        const cells = Array.from({ length: 5 }, (_, k) => new Float32Array(buf8, PROBE_F + k * FX * 4, FX));
+        insp.data = { g, pos: [pf[0], pf[1]], vel: [pf[2], pf[3]], energy: pf[4], age: pf[5], alive: pu[6], kids: pu[7], mem: [pf[8], pf[9]], cells };
+        insp.pos = [pf[0], pf[1]];
+        insp.r = Math.min(10, Math.max(1, Math.round(asF32(g[1]))));
+        renderInspector();
+        insp.busy = false;
+      }).catch(() => { insp.busy = false; });
       return;
     }
     // gene bank sampling: gather random slots' genomes for readback
@@ -1232,7 +1508,9 @@ async function main() {
           const alive = all[metaOff + j * 4], kids = all[metaOff + j * 4 + 1];
           if (!alive || kids < 1) continue;     // only proven reproducers enter the bank
           const age = asF32(all[metaOff + j * 4 + 2]);
-          bank.add(all.slice(j * GS, (j + 1) * GS), { kids, age });
+          const g = all.slice(j * GS, (j + 1) * GS);
+          bank.add(g, { kids, age });
+          considerOwn(g, kids + age / 2000, kids >= 2);
         }
         if (selected && !bank.entries.includes(selected)) selected = bank.entries.find(e => e.id === selected.id) || null;
         gatherPending = false;
@@ -1243,7 +1521,11 @@ async function main() {
 
   function frame(now) {
     rateFrames++;
-    const steps = paused ? 0 : ui.spf;
+    // GPU commitment: simulate on that share of frames, so the page uses roughly that share of the card
+    commitAcc += ui.commit / 100;
+    const simThisFrame = commitAcc >= 1;
+    if (simThisFrame) commitAcc -= 1;
+    const steps = paused || !simThisFrame ? 0 : ui.spf;
     if (!paused) {
       for (const s of sources) {
         s.vx = s.vx * 0.995 + (Math.random() - 0.5) * 0.02;
@@ -1257,15 +1539,27 @@ async function main() {
       }
       if ($('immigrate').checked && bank.entries.length >= 8 && now - lastImmig > 15000) { lastImmig = now; plantRandom(); }
       if (now - lastSave > 30000) { lastSave = now; saveBank(); }
+      if (!document.hidden) { workPending += steps * stats.alive; lifeWork += steps * stats.alive; }
+      // keep your strain in play: when its share falls below 5%, re-plant its most advanced genome at your node
+      if (stats.alive > 0 && (stats.mine < stats.alive * 0.05 || championChanges > plantedChampion) && now - lastStrainPlant > 20000) {
+        plantedChampion = championChanges;
+        lastStrainPlant = now;
+        queuePlant({ genome: strainBest.g }, myNode.x * G, myNode.y * G, 16, 450);
+      }
     }
+    if (SHARED && now - lastSync > 60000) { lastSync = now; syncShared(); }
+    if (SHARED && now - lastUpload > 45000) { lastUpload = now; uploadShared(); }
 
     runPrePass(now);
 
     // main uniforms: plant stage 1 clears its area via the eraser path this frame
     const p1 = !paused && plantQ.find(p => p.stage === 1);
     if (p1) p1.stage = 2;
-    if (p1) writeUniforms({ mouseOn: 1, mx: p1.x, my: p1.y, mr: p1.r });
-    else writeUniforms({ mouseOn: mouse.down && !paused ? 1 : 0, mx: ((mouse.x % G) + G) % G, my: ((mouse.y % G) + G) % G, mr: brushWorld() });
+    const seeding = seedProb > 0 && !paused;
+    if (seeding) device.queue.writeBuffer(reqs, 0, strainBest.g);
+    const sf = seeding ? seedStrainFrac : 0;
+    if (p1) writeUniforms({ mouseOn: 1, mx: p1.x, my: p1.y, mr: p1.r, strainFrac: sf });
+    else writeUniforms({ mouseOn: mouse.down && !paused ? 1 : 0, mx: ((mouse.x % G) + G) % G, my: ((mouse.y % G) + G) % G, mr: brushWorld(), strainFrac: sf });
 
     const enc = device.createCommandEncoder();
     const timeIt = hasTS && !tsPending && steps > 0;
@@ -1275,6 +1569,7 @@ async function main() {
       pass.setPipeline(K.reset); pass.dispatchWorkgroups(1);
       pass.setPipeline(K.seed); pass.dispatchWorkgroups(wg);
       seedProb = 0;
+      seedStrainFrac = 0.4;
     }
     for (let s = 0; s < steps; s++) {
       pass.setBindGroup(0, cGroups[cur]);
@@ -1291,7 +1586,8 @@ async function main() {
 
     cam.cx = ((cam.cx % G) + G) % G; cam.cy = ((cam.cy % G) + G) % G;
     camF[0] = cam.cx; camF[1] = cam.cy; camF[2] = cam.scale; camU[3] = mode;
-    camF[4] = canvas.width; camF[5] = canvas.height; camF[6] = Math.max(0.9, cam.scale * 0.38); camF[7] = ui.fgain;
+    camF[4] = canvas.width; camF[5] = canvas.height; camF[6] = Math.max(0.9, cam.scale * 0.42); camF[7] = ui.fgain;
+    camU[8] = strainTag; camU[9] = $('highlight').checked ? 1 : 0; camU[10] = $('pstyle').value === 'dots' ? 1 : 0;
     device.queue.writeBuffer(camBuf, 0, camData);
 
     const rp = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }] });
@@ -1322,6 +1618,7 @@ async function main() {
         stats.alive = c[2]; stats.births = c[3]; stats.deaths = c[4];
         stats.params = c[2] ? c[5] / c[2] : 0; stats.hidden = c[2] ? c[6] / c[2] : 0; stats.gen = c[7];
         stats.effects = Array.from(c.slice(16, 16 + NT));
+        stats.mine = c[10];
         stats.uptakes = c[11]; stats.injections = c[12]; stats.bonded = c[13]; stats.learners = c[14]; stats.shared = c[15] / 100000;
         stats.pending = false;
       });
@@ -1344,12 +1641,31 @@ async function main() {
         `learners   ${stats.alive ? (100 * stats.learners / stats.alive).toFixed(0) : 0}% learn within life\n` +
         `bonded     ${stats.bonded.toLocaleString()} this step · ${stats.shared.toFixed(2)} E shared\n` +
         `genes      ${stats.uptakes.toLocaleString()} taken · ${stats.injections.toLocaleString()} injected`;
+      renderStrains();
       const tot = Math.max(1, stats.alive * KE);
       $('effects').textContent = EFFECTS.map((n, t) => [n, stats.effects[t] / tot]).filter(([n]) => n !== 'none')
         .sort((a, b) => b[1] - a[1])
         .map(([n, f]) => `${n.padEnd(9)} ${'█'.repeat(Math.round(f * 60)).padEnd(14)} ${(f * 100).toFixed(1)}%`).join('\n');
     }
-    $('hud').textContent = `zoom=${(cam.scale / cam.fit).toFixed(1)}x  pop=${stats.alive}  ${stepRate.toFixed(1)} steps/s  ${fps.toFixed(0)} fps  ${canvas.width}px  bank=${bank.entries.length}${paused ? '  [paused]' : ''}`;
+    placeRing();
+    placeNodes();
+    if (frameNo % 15 === 0) drawWorld();
+    if (!fitDone && !paused && now - bootT > 3000) {
+      if (now - bootT < 9000) fitSamples.push(fps);
+      else {
+        fitDone = true;
+        const avg = fitSamples.reduce((a, b) => a + b, 0) / Math.max(1, fitSamples.length);
+        let tries = 0; try { tries = +(sessionStorage.getItem('fieldlife-fittries') || 0); } catch {}
+        if (avg < 22 && N > 16384 && tries < 3) {
+          const next = Math.max(16384, Math.floor(N / 2 / 128) * 128);
+          try { localStorage.setItem('fieldlife-n', next); sessionStorage.setItem('fieldlife-downsized', next); sessionStorage.setItem('fieldlife-fittries', tries + 1); } catch {}
+          saveBank(); location.reload(); return;
+        }
+        try { localStorage.setItem('fieldlife-n', avg > 50 && N < N_GUESS ? Math.min(N_GUESS, N * 2) : N); } catch {}
+      }
+    }
+    if (fitNote && now - bootT > 12000) fitNote = '';
+    $('hud').textContent = `zoom=${(cam.scale / cam.fit).toFixed(1)}x  pop=${stats.alive}  ${stepRate.toFixed(1)} steps/s  ${fps.toFixed(0)} fps  ${canvas.width}px  bank=${bank.entries.length}${paused ? '  [paused]' : ''}${fitNote ? '\n' + fitNote : ''}`;
     frameNo++;
     requestAnimationFrame(frame);
   }

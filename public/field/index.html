@@ -2,21 +2,25 @@
 <html lang="en">
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Field Life — aintfarm</title>
-  <meta name="description" content="Hundreds of thousands of particles, each its own untrained, mutating neural net with mutable physics, evolving on a shared field. Runs on your GPU with WebGPU.">
+  <title>aint farm — artificial intelligence neural training farm</title>
+  <meta name="description" content="aint farm: an artificial intelligence neural training farm. Hundreds of thousands of particles, each its own untrained, mutating neural net with mutable physics, evolve on a shared field on your GPU, and every visitor's strain joins one shared gene bank.">
+  <meta property="og:title" content="aint farm">
+  <meta property="og:description" content="Artificial intelligence neural training farm: watch a quarter-million tiny neural nets evolve on your GPU, and add your own strain to the shared gene bank.">
+  <meta property="og:image" content="https://aintfarm.sardistic.com/field/preview.jpg">
   <link rel="icon" href="https://sardistic.com/wp-content/sardize/eye.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="https://sardistic.com/wp-content/sardize/eye-180.png">
   <script src="https://sardistic.com/wp-content/sardize/transit.js?v=2"></script>
   <style>
-    :root { --fg: #d8f0e0; --dim: #7a8a80; --panel: rgba(8, 10, 12, 0.84); --line: rgba(255,255,255,0.12); --acc: #6fe3a8; }
+    :root { --fg: #d8f0e0; --dim: #7a8a80; --panel: rgba(8, 10, 12, 0.84); --line: rgba(255,255,255,0.12); --acc: #6fe3a8; --amber: #f7cf5a; }
     html, body { margin: 0; height: 100%; background: #000; color: var(--fg); font: 12px/1.4 ui-monospace, Consolas, monospace; overflow: hidden; }
     #c { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; cursor: crosshair; touch-action: none; }
     #hud { position: fixed; top: 6px; left: 8px; pointer-events: none; text-shadow: 0 0 3px #000, 0 0 3px #000; white-space: pre; }
-    #panel { position: fixed; top: 8px; right: 8px; width: 272px; max-height: calc(100vh - 16px); overflow-y: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; backdrop-filter: blur(6px); box-sizing: border-box; }
+    #panel { position: fixed; top: 8px; right: 8px; width: 284px; max-height: calc(100vh - 16px); overflow-y: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; backdrop-filter: blur(6px); box-sizing: border-box; }
     #panel.collapsed > :not(header) { display: none; }
-    #panel header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
-    #panel h1, #panel h2 { font-size: 12px; margin: 0; letter-spacing: 0.08em; }
-    #panel h2 { margin: 12px 0 4px; padding-top: 8px; border-top: 1px solid var(--line); color: var(--dim); font-weight: normal; }
+    #panel header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 6px; gap: 8px; }
+    #panel h1 { font-size: 15px; margin: 0; letter-spacing: 0.12em; }
+    #panel h1 small { display: block; font-size: 9.5px; letter-spacing: 0.04em; color: var(--dim); font-weight: normal; margin-top: 2px; }
+    #panel h2 { font-size: 12px; margin: 12px 0 4px; padding-top: 8px; border-top: 1px solid var(--line); color: var(--dim); font-weight: normal; letter-spacing: 0.08em; }
     label { display: grid; grid-template-columns: 92px 1fr 52px; align-items: center; gap: 6px; margin: 4px 0; color: var(--dim); }
     label.check { display: flex; gap: 6px; }
     label output { color: var(--fg); text-align: right; }
@@ -24,29 +28,58 @@
     select, button { background: #111; color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: 3px 7px; font: inherit; cursor: pointer; }
     button:hover, select:hover { border-color: var(--acc); }
     button.on { border-color: var(--acc); color: var(--acc); }
-    .row { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0; }
-    .pre { white-space: pre; }
-    #stats, #effects, #species { white-space: pre; }
-    #effects { color: var(--dim); }
+    .row { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0; align-items: center; }
+    .pre, #stats, #effects, #species { white-space: pre; }
+    #strainInfo { white-space: pre-wrap; min-width: 0; }
+    #effects, .dim { color: var(--dim); }
     #map { width: 100%; height: 170px; background: #050607; border: 1px solid var(--line); border-radius: 4px; cursor: pointer; display: block; }
     #species { margin-top: 4px; white-space: pre-wrap; min-height: 2.8em; }
+    .strain { display: flex; gap: 10px; align-items: center; }
+    #thumb { width: 40px; height: 40px; image-rendering: pixelated; border: 1px solid rgba(247,207,90,.4); border-radius: 4px; background: #050607; padding: 3px; flex: none; }
+    #online { color: var(--dim); margin: 4px 0; }
+    .srow { display: flex; align-items: center; gap: 6px; padding: 1px 0; }
+    .srow b { color: var(--amber); font-weight: normal; }
+    .srow .sw { width: 9px; height: 9px; border-radius: 2px; flex: none; }
+    .srow .sr { margin-left: auto; color: var(--dim); }
     details { color: var(--dim); margin-top: 8px; }
     details p { margin: 4px 0; }
     #err { position: fixed; inset: 0; display: none; place-items: center; padding: 24px; color: #ff9a9a; white-space: pre-wrap; background: #000; }
     input[type=file] { display: none; }
+    #inspector { position: fixed; top: 46px; left: 8px; width: 330px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; backdrop-filter: blur(6px); box-sizing: border-box; }
+    #inspector header { display: flex; justify-content: space-between; align-items: center; color: var(--dim); letter-spacing: .08em; margin-bottom: 4px; }
+    #netc { width: 100%; height: 230px; display: block; border-radius: 4px; }
+    #insp { white-space: pre-wrap; margin-top: 4px; }
+    #world { width: 100%; aspect-ratio: 1; display: block; background: #050607; border: 1px solid var(--line); border-radius: 4px; margin: 6px 0; cursor: pointer; }
+    #nodes { position: fixed; inset: 0; pointer-events: none; overflow: hidden; }
+    .node { position: absolute; left: -7px; top: -7px; width: 14px; height: 14px; border-radius: 3px; border: 2px solid hsl(var(--h) 85% 62%); box-shadow: 0 0 8px hsl(var(--h) 85% 50% / .8); box-sizing: border-box; }
+    .node::after { content: ''; position: absolute; inset: 3px; background: hsl(var(--h) 85% 62%); border-radius: 1px; }
+    .node span { position: absolute; left: 18px; top: -3px; white-space: nowrap; font-size: 10px; color: hsl(var(--h) 70% 75%); text-shadow: 0 0 3px #000, 0 0 3px #000; opacity: .75; }
+    .node.mine { border-color: var(--amber); box-shadow: 0 0 12px rgba(247,207,90,.9); }
+    .node.mine span { color: var(--amber); opacity: 1; font-weight: bold; }
+    .node.off { opacity: .45; }
+    #ring { position: fixed; left: 0; top: 0; width: 28px; height: 28px; border: 2px solid var(--amber); border-radius: 50%; pointer-events: none; box-shadow: 0 0 10px rgba(247,207,90,.7); }
+    #nogpu { position: fixed; inset: 0; display: grid; place-items: center; padding: 24px; background: #000; overflow: auto; }
+    #nogpu[hidden] { display: none; }
+    #nogpu .card { max-width: 640px; }
+    #nogpu h1 { font-size: 22px; letter-spacing: .12em; margin: 0 0 2px; }
+    #nogpu img { width: 100%; border-radius: 6px; border: 1px solid var(--line); margin: 14px 0; }
+    #nogpu a { color: var(--acc); }
+    body.nogpu #panel, body.nogpu #hud, body.nogpu #c { display: none; }
+    @media (max-width: 700px) { #inspector { width: calc(100vw - 16px); } #panel { width: calc(100vw - 16px); } }
   </style>
 </head>
 <body>
   <canvas id="c"></canvas>
   <div id="hud">starting…</div>
   <aside id="panel">
-    <header><h1>FIELD LIFE</h1><button id="collapse" type="button" title="Collapse">–</button></header>
+    <header><h1>AINT FARM<small>artificial intelligence neural training farm</small></h1><button id="collapse" type="button" title="Collapse">–</button></header>
     <label>sunlight <input id="sun" type="range" min="0" max="3" step="0.05" value="1"><output></output></label>
     <label>metabolism <input id="metab" type="range" min="0" max="0.006" step="0.0001" value="0.0012"><output></output></label>
     <label>param cost <input id="pcost" type="range" min="0" max="0.00002" step="0.0000005" value="0.000001"><output></output></label>
     <label>mutation <input id="mut" type="range" min="0" max="4" step="0.05" value="1"><output></output></label>
     <label>pressure <input id="pressure" type="range" min="0" max="1" step="0.01" value="0.3"><output></output></label>
     <label title="Attraction toward denser regions at each particle's sensing range; with short-range pressure this gives surface tension">cohesion <input id="cohesion" type="range" min="0" max="1" step="0.01" value="0.15"><output></output></label>
+    <label title="Share of frames your GPU spends simulating. Everything it simulates is credited to your strain's score.">GPU commit <input id="commit" type="range" min="10" max="100" step="5" value="100"><output></output></label>
     <label>steps/frame <input id="spf" type="range" min="1" max="8" step="1" value="2"><output></output></label>
     <label>brush <input id="brush" type="range" min="2" max="120" step="1" value="24"><output></output></label>
     <label>field gain <input id="fgain" type="range" min="0" max="4" step="0.05" value="1"><output></output></label>
@@ -58,33 +91,48 @@
         <option value="3">sunlight</option>
         <option value="4">density</option>
       </select>
+      <select id="pstyle" title="Particle look: body shapes from each particle's dominant gene, or plain dots">
+        <option value="shapes">shapes</option>
+        <option value="dots">dots</option>
+      </select>
       <button id="pause" type="button">pause</button>
-      <button id="seed" type="button" title="Spawn random (untrained) particles into empty slots">seed</button>
-      <button id="reset" type="button">reset</button>
     </div>
     <div class="row">
+      <button id="seed" type="button" title="Spawn random (untrained) particles into empty slots">seed</button>
+      <button id="reset" type="button">reset</button>
       <select id="preset" title="Sets pressure/cohesion and the kind of founders, then resets the dish">
         <option value="default">preset: default</option>
         <option value="membranes">preset: membranes</option>
         <option value="soup">preset: soup</option>
       </select>
+    </div>
+    <div class="row">
       <label class="check" title="Turn within-life learning on or off for every particle (the learning-rate gene is kept)"><input id="learn" type="checkbox" checked> learning</label>
+      <label class="check" title="Dim everything except descendants of your strain"><input id="highlight" type="checkbox"> highlight my strain</label>
     </div>
     <div class="row">
       <button id="toolErase" class="on" type="button" title="Left-drag kills particles (E)">erase</button>
       <button id="toolPlant" type="button" title="Left-click plants the selected gene-bank species (P)">plant</button>
+      <button id="toolInspect" type="button" title="Click a particle to see its net think (I)">inspect</button>
+      <button id="toolNode" type="button" title="Click to place your node: the one spot where your strain enters every visitor's dish (N)">node</button>
     </div>
     <div id="stats"></div>
+
+    <h2>YOUR STRAIN</h2>
+    <div class="strain"><canvas id="thumb" width="40" height="40" title="Your strain's thumbprint, derived from this browser"></canvas><div id="strainInfo"></div></div>
+    <div id="online"></div>
+    <canvas id="world" width="496" height="496" title="World map: every strain's node in the shared coordinates all dishes use. Gold is you, size is GPU score, faded are offline. Click to look there."></canvas>
+    <div id="strains"></div>
 
     <h2>EFFECT GENES IN POPULATION</h2>
     <div id="effects"></div>
 
     <h2>GENE BANK</h2>
-    <canvas id="map" width="496" height="340" title="Each dot is an archived net, placed by a PCA of its phenotype vector. Click to select."></canvas>
+    <canvas id="map" width="496" height="340" title="Each dot is an archived net, placed by a PCA of its phenotype vector. Gold rings are your strain, pale rings came from the shared bank. Click to select."></canvas>
     <div id="bankStats" class="pre"></div>
     <div id="species">click a dot to select a species</div>
     <div class="row">
-      <button id="plantRandom" type="button" title="Plant a random archived species somewhere">plant random</button>
+      <button id="plantRandom" type="button" title="Plant an archived species somewhere (weighted toward strains with more GPU work behind them)">plant random</button>
       <label class="check" title="Every 15 s, plant an archived species to counter monocultures"><input id="immigrate" type="checkbox" checked> immigration</label>
     </div>
     <div class="row">
@@ -96,19 +144,36 @@
 
     <details>
       <summary>how it works</summary>
-      <p>Each particle is its own neural net. Nets start random (untrained) and are never trained by gradients. Selection is what shapes them.</p>
-      <p>Particles never interact directly. They read, absorb from, and write to a shared G×G×F field. Channel 0 is energy from drifting suns. Channels 1–7 are information. A hidden density channel records how crowded each cell is.</p>
-      <p><b>Chemistry</b> is a per-channel rule: an absorb rate, the energy gained or lost per unit absorbed, and a push along that channel's gradient.</p>
-      <p><b>Effect genes</b> are 4 slots. Each holds one of 16 primitives: taxis, swirl, isoline-seeking, catalysis (a→b), jet, anchor, pressure/cohesion, pulsed emission, siphon at range, signal relay (a→b), heat, toxin shield, global drift, gene uptake, gene injection, and kin bonding. Every slot has its own channels and parameters, and its strength is gated by the net on each step. Mutation can rewrite a slot into any effect, rewire its channels, or retune it.</p>
-      <p><b>Gene transfer and bodies.</b> <i>Uptake</i> copies an effect gene, and sometimes a block of weights, from whoever shared your cell last step. <i>Inject</i> writes your gene into them, like a plasmid or virus. <i>Bond</i> springs you toward neighbours whose inherited bond key nearly matches yours and matches their velocity, so kin can hold together as multicellular bodies.</p>
-      <p><b>Bodies share energy.</b> A bonded particle richer than its kin leaves some energy in the kin's cell. Only that cell's occupant can collect it, and anything unclaimed leaks back into the energy channel, so no energy is created.</p>
-      <p><b>Learning within a lifetime.</b> Each particle has an evolved learning rate. When it is non-zero, the net adjusts its own hidden-to-output weights every other step with a reward-modulated Hebbian rule: actions that raised its energy above its recent average get strengthened. Children inherit the learned weights (Lamarckian), so evolution and learning stack.</p>
-      <p>The <b>net</b> sees the field and its gradients at an evolved range, plus density, energy, velocity, 2 memory registers it writes itself, and an internal clock. It outputs split, child share, write, aim, memory, and 4 effect gates. The hidden width mutates.</p>
-      <p>The <b>gene bank</b> is a vector database of evolved nets. Every second, the GPU samples genomes that have reproduced. Each is embedded as a 49-dim vector of chemistry, effects, architecture, and a random projection of its weights. A new genome that lands within the niche radius of an existing entry replaces it only if it's fitter (more offspring). Otherwise it becomes a new niche. The map is a live PCA of that space. Selected species can be planted, and immigration re-injects archived species to stop monocultures. The bank persists in this browser.</p>
+      <p><b>aint farm</b> is an artificial intelligence neural training farm: an ant farm for AI. Every particle is its own neural net. Nets start random (untrained) and are never trained by gradients. Selection, and each particle's own lifetime learning, are what shape them.</p>
+      <p><b>Your strain.</b> Your browser gets a permanent thumbprint: a strain tag, a colour, and a founder genome generated from it. About 40% of founders in your dish are your strain. Your strain is your GPU's champion: whenever your dish evolves a net that out-reproduces your strain's best, that net takes over your thumbprint. Descendants carry the tag forever. Their best genomes enter the shared gene bank, and each visit resumes from your strain's most advanced genome. The <i>GPU commit</i> slider sets how much of your card the farm uses. Every particle-step your GPU simulates is credited to your strain's score, and immigration into everyone's dish favours strains with more GPU work behind them. The longer you run, the further your strain evolves and spreads.</p>
+      <p><b>Your node.</b> Every strain has one node: the spot in the world where it enters every visitor's dish. Yours is random until you place it with the <i>node</i> tool. The world map shows every strain's node, and all dishes share the same coordinates, so an immigrant from another visitor's strain always arrives at its node.</p>
+      <p><b>The shared gene bank</b> is a vector database of evolved nets, one for all visitors. Every second your GPU samples genomes that have reproduced and embeds each as a 49-dim vector: chemistry, effects, architecture, and a fingerprint of its weights. A newcomer that lands in an existing niche replaces it only if it's fitter. Otherwise it opens a new niche. The map is a live PCA of that space.</p>
+      <p>Particles never interact directly. They read, absorb from, and write to a shared field. Channel 0 is energy from drifting suns. Channels 1–7 are information. Hidden channels record density, who is in each cell, and energy left for kin.</p>
+      <p><b>Chemistry</b> is a per-channel rule: absorb rate, energy gained or lost, and a push along that channel's gradient. <b>Effect genes</b> are 4 slots, each one of 17 primitives: taxis, swirl, isoline, catalysis, jet, anchor, pressure, pulse, siphon, relay, heat, shield, drift, gene uptake, gene injection, kin bonding, and edge-seeking (settling on boundaries, for membranes). The net gates each slot on every step, and mutation can rewrite any of them.</p>
+      <p><b>Shapes.</b> A particle's body shows its dominant gene: comets move (taxis, swirl, jet, drift), rings bond, diamonds anchor or shield, stars swap genes, dashes build edges, and cells with a nucleus are learners. Moving particles stretch along their velocity.</p>
+      <p><b>Learning within a lifetime.</b> An evolved learning rate lets a net adjust its output weights every other step, strengthening actions that raised its energy. Children inherit the learned weights. <b>Bodies</b> share energy through a slot only their kin can collect.</p>
+      <p><b>Inspect</b> any particle to see its 33 senses, hidden layer, outputs and effect gates, recomputed live from its genome.</p>
       <p>The original ant farm is still at <a href="/farm" style="color:var(--acc)">/farm</a>.</p>
-      <p>Left-drag uses the current tool. Scroll zooms. Right- or middle-drag pans. Space pauses. Keys 1–5 switch the view. E and P switch tools.</p>
+      <p>Left-drag uses the current tool. Scroll zooms. Right- or middle-drag pans. Space pauses. Keys 1–5 switch the view. E, P, I, and N switch tools.</p>
     </details>
   </aside>
+  <section id="inspector" hidden>
+    <header><span>INSPECTING A PARTICLE</span><button id="inspClose" type="button" title="Stop inspecting">×</button></header>
+    <canvas id="netc" width="620" height="460"></canvas>
+    <div id="insp">reading…</div>
+  </section>
+  <div id="ring" hidden></div>
+  <div id="nodes"></div>
+  <section id="nogpu" hidden>
+    <div class="card">
+      <h1>AINT FARM</h1>
+      <div class="dim">artificial intelligence neural training farm</div>
+      <img src="/field/preview.jpg" alt="A dish of hundreds of thousands of coloured particles forming clusters over a glowing chemical field">
+      <p>Hundreds of thousands of particles, each its own untrained, mutating neural net, evolve on a shared chemical field. They run on your graphics card through <b>WebGPU</b>, which this browser doesn't provide.</p>
+      <p>Open this page in a recent <b>Chrome</b> or <b>Edge</b> on a desktop with hardware acceleration on. Safari 26+ and Firefox 141+ on Windows also work.</p>
+      <p>Meanwhile, the original <a href="/farm">ant farm</a> runs in any browser.</p>
+    </div>
+  </section>
   <div id="err"></div>
   <script type="module" src="/field/field.js"></script>
   <script src="/sard-eye.js" defer></script>
