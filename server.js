@@ -9,7 +9,7 @@ const sharedBank = createSharedBank({ dataDir: process.env.DATA_DIR || join(proc
 await sharedBank.load();
 for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, async () => { await sharedBank.save(); process.exit(0); });
 
-const types = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png' };
+const types = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg' };
 const questions = {
   chambers: { type: 'noul', instructions: 'Does `artwork` show more than one distinct underground chamber?' },
   branches: { type: 'noul', instructions: 'Do the underground tunnels in `artwork` branch into separate paths?' },

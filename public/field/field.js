@@ -594,9 +594,11 @@ fn plant(@builtin(global_invocation_id) gid: vec3u) {
   let j = gid.x;
   let used = min(min(atomicLoad(&counters[0]), atomicLoad(&counters[1])), N);
   let avail = atomicLoad(&counters[1]) - used;
-  if (j >= min(u.plantCount, avail)) { return; }
-  let slot = freeList[used + j];
+  if (j >= u.plantCount) { return; }
   rs = stepSeed(j * 2971u + 99991u);
+  // use slots freed by the previous step first; when the dish is full, replace random particles elsewhere
+  var slot = 0u;
+  if (j < avail) { slot = freeList[used + j]; } else { slot = min(u32(rnd() * f32(N)), N - 1u); }
   for (var w = 0u; w < GS; w++) { sw(slot, w, uploadWord(w)); }
   mutateCopy(slot, slot);
   let ang = rnd() * 6.2832;
