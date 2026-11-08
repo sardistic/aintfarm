@@ -21,6 +21,8 @@ export function createWorld({ dataDir, strainOf, touch = () => {} }) {
   const reported = new Map();                // tag -> sessions reporting this tick
   const lastReportTick = new Map();          // tag -> tick of its latest report
   const lastObs = new Map();                 // sid -> ms
+  const sessionRate = new Map();             // sid -> { rate, tick, strain }: each viewer's live GPU contribution
+  const powerHistory = [];                   // network total, sampled every 5 ticks (newest last)
   const events = [];                         // recent notable moments, newest first
   const file = join(dataDir, 'world.json');
   let tickNo = 0, dirty = false;
@@ -62,6 +64,7 @@ export function createWorld({ dataDir, strainOf, touch = () => {} }) {
     power.set(body.strain, (power.get(body.strain) || 0) * 0.7 + rate * 0.3 * (1 + (reported.get(body.strain) || 0) * 0.5));
     reported.set(body.strain, (reported.get(body.strain) || 0) + 1);
     lastReportTick.set(body.strain, tickNo);
+    sessionRate.set(sid, { rate: Math.min(rate, MAX_RATE * 2), tick: tickNo, strain: body.strain });
     // the viewer's own GPU weights its evidence; total evidence per report is capped
     const w = Math.sqrt(Math.min(rate, MAX_RATE) / MAX_RATE);
     let total = 0;
@@ -84,8 +87,19 @@ export function createWorld({ dataDir, strainOf, touch = () => {} }) {
     return prev && prev !== tag ? prev : null;
   }
 
+  // the whole network's live GPU power: every viewer who reported recently (hidden tabs report 0)
+  function network() {
+    let total = 0, viewers = 0;
+    for (const [sid, s] of sessionRate) {
+      if (tickNo - s.tick > REPORT_GRACE_TICKS) { sessionRate.delete(sid); continue; }
+      if (s.rate > 0) { total += s.rate; viewers++; }
+    }
+    return { total, viewers };
+  }
+
   function tick() {
     tickNo++;
+    if (tickNo % 5 === 0) { powerHistory.push(Math.round(network().total)); if (powerHistory.length > 120) powerHistory.shift(); }
     const overrun = new Map();   // "a>b" -> cells taken this tick
     for (const [tag, p] of power) {
       if (tickNo - (lastReportTick.get(tag) ?? -1e9) > REPORT_GRACE_TICKS) power.set(tag, p * POWER_DECAY);
@@ -152,6 +166,7 @@ export function createWorld({ dataDir, strainOf, touch = () => {} }) {
       palette: palette.map(t => ({ tag: t, cells: counts.get(t), power: Math.round(power.get(t) || 0), node: strainOf(t)?.node || null })),
       owner: Buffer.from(own).toString('base64'), strength: Buffer.from(str).toString('base64'),
       events: events.slice(0, 8),
+      network: { ...network(), history: powerHistory.slice(-60) },
     };
   }
 

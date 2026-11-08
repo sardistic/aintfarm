@@ -56,3 +56,14 @@ test('a strain whose viewers leave erodes while a watched one keeps growing', as
   assert.ok(held(w, 'bbbbbbbb') < b0, `b eroded from ${b0} to ${held(w, 'bbbbbbbb')}`);
   assert.ok(held(w, 'aaaaaaaa') > a0, `a kept growing from ${a0} to ${held(w, 'aaaaaaaa')}`);
 });
+
+test('reports the live network total from every recent viewer', async () => {
+  const w = await make();
+  report(w, 'viewerone1', 'aaaaaaaa', 3e6);
+  report(w, 'viewertwo2', 'bbbbbbbb', 5e6);
+  report(w, 'viewerhid3', 'bbbbbbbb', 0);        // a hidden tab reports zero and isn't counted as contributing
+  w.tick();
+  assert.deepEqual({ total: w.state().network.total, viewers: w.state().network.viewers }, { total: 8e6, viewers: 2 });
+  for (let t = 0; t < 20; t++) w.tick();         // nobody reports again
+  assert.equal(w.state().network.viewers, 0);
+});

@@ -1268,6 +1268,7 @@ async function main() {
   const WW = 64;                                      // territory cells per side (matches world.js)
   let worldState = null, worldOwner = null, worldStr = null, worldBusy = false, lastWorld = -1e9, lastObserve = performance.now();
   const genomeOf = new Map();                         // strain tag (hex) -> champion genome for planting
+  let lastReportedRate = 0;
   const obsCounts = new Map();                        // "cell,tag" -> samples seen since the last report
   const knownStrains = () => new Set([strainHex, ...(worldState?.palette || []).map(p => p.tag), ...(shared?.strains || []).map(s => s.tag)]);
   let known = new Set([strainHex]);
@@ -1340,10 +1341,11 @@ async function main() {
   async function reportWorld() {
     if (!SHARED) return;
     const obs = [...obsCounts].map(([k, n]) => { const [c, tag] = k.split(','); return [+c, tag, n]; });
+    lastReportedRate = Math.round(document.hidden ? 0 : stepRate * stats.alive);
     obsCounts.clear();
     try {
       await fetch('/api/world/observe', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sid, strain: strainHex, node: myNode, rate: Math.round(document.hidden ? 0 : stepRate * stats.alive), obs }) });
+        body: JSON.stringify({ sid, strain: strainHex, node: myNode, rate: lastReportedRate, obs }) });
     } catch (e) { console.warn('world report failed', e.message); }
   }
   // the local dish mirrors the shared world: every few seconds an owned region is re-seeded with its owner's champion,
@@ -1361,7 +1363,28 @@ async function main() {
       return;
     }
   }
+  // live network power: every viewer's GPU contribution, and yours
+  const spark = $('netSpark'), spctx = spark.getContext('2d');
+  function renderNetwork() {
+    const n = worldState?.network; if (!n) return;
+    const mine = document.hidden ? 0 : stepRate * stats.alive;
+    // the server's total contains the rate this browser last reported; swap in the live value so shares add up
+    const total = Math.max(mine, n.total - lastReportedRate + mine);
+    $('netTotal').textContent = fmtWork(total) + '/s';
+    $('netViewers').textContent = `${Math.max(n.viewers, mine > 0 ? 1 : 0)} GPU${n.viewers === 1 ? '' : 's'}`;
+    $('netYou').textContent = `you ${fmtWork(mine)}/s · ${total ? (100 * mine / total).toFixed(0) : 0}%`;
+    const h = n.history || [], W = spark.width, H = spark.height, max = Math.max(1, ...h, total);
+    spctx.clearRect(0, 0, W, H);
+    if (h.length > 1) {
+      spctx.beginPath();
+      h.forEach((v, i) => { const x = i / (h.length - 1) * W, y = H - 2 - (v / max) * (H - 4); i ? spctx.lineTo(x, y) : spctx.moveTo(x, y); });
+      spctx.strokeStyle = '#6fe3a8'; spctx.lineWidth = 2; spctx.stroke();
+      spctx.lineTo(W, H); spctx.lineTo(0, H); spctx.closePath(); spctx.fillStyle = 'rgba(111,227,168,.15)'; spctx.fill();
+    }
+  }
+
   function renderWorldBoard() {
+    renderNetwork();
     const pal = [...(worldState?.palette || [])].sort((a, b) => b.cells - a.cells);
     const total = WW * WW;
     const mine = pal.find(p => p.tag === strainHex);
