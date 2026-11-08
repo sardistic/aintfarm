@@ -73,3 +73,11 @@ Uploads and downloads run in their own submits before the frame's steps, so they
 Field Life is the product, so it serves at `/`. The ant farm stays reachable at `/farm`, unchanged, because its absolute asset paths still resolve from there. Production is a single non-root Node container built from this repository's `main` branch, matching the house pattern for small public apps: a Git checkout on the host, Docker Compose, Cloudflare Tunnel, and no published ports. Host-specific details live in the private infrastructure runbook, not here.
 
 The server sends `Cache-Control: no-cache` so deploys are visible at once through Cloudflare. It answers HEAD requests, for probes, and exposes `/healthz` for the container healthcheck. Pages carry the sardistic eye favicon, the shared `sardize/transit.js` cross-site transition, and a fixed eye link back to sardistic.com.
+
+## 2026-11-08 — Gene transfer, kin bonding, within-life learning
+
+The field gained a second hidden slot per cell (stride F+2). It holds the id of a particle that occupied the cell in the previous step, written with `atomicMax` and carried across the field step as bits in an f32. This is the only way particles can find a neighbour. It keeps the field as the medium and avoids adding a ninth storage binding.
+
+Three effect types use it: uptake (copy a gene in), inject (copy a gene out) and bond (spring plus velocity matching toward kin, judged by bond-key Hamming distance). Gene copies race benignly with the donor's own updates. Learning updates W2 in place in the genome: two packed f16 weights per word, every other step, only when the learning-rate gene is above 5e-4. That makes inheritance Lamarckian, and it avoids keeping a second weight copy, which would double genome memory.
+
+In a 60 s run at 131k slots, inject rose from 4.1% to 7.4% of gene slots, bond from 3.2% to 5.0%, and learners from 53% to 58%. The genome is now 371 words, and old gene banks are keyed separately (v3).

@@ -9,20 +9,23 @@ const HMAX = clampInt(qs.get('h'), 2, 32, 12);      // max hidden width (actual 
 const G = clampInt(qs.get('g'), 128, 2048, 768);    // field grid size
 const N_REQ = clampInt(qs.get('n'), 1024, 2_000_000, 262144);
 const SOURCES = 12;
-const FS = F + 1;                // field stride: F channels + density
+const FS = F + 1;                // sensed channels: F evolvable + density
+const FX = F + 2;                // field stride: + occupant id (who is in this cell, for gene transfer and bonding)
 const KE = 4;                    // effect-gene slots per particle
-const EFFECTS = ['none', 'taxis', 'swirl', 'isoline', 'catalyse', 'jet', 'anchor', 'pressure', 'pulse', 'siphon', 'relay', 'heat', 'shield', 'drift'];
+const EFFECTS = ['none', 'taxis', 'swirl', 'isoline', 'catalyse', 'jet', 'anchor', 'pressure', 'pulse', 'siphon', 'relay', 'heat', 'shield', 'drift', 'uptake', 'inject', 'bond'];
 const NT = EFFECTS.length;
 const NI = 3 * FS + 6;           // value+gradx+grady per channel (incl. density), energy, vel.xy, mem.xy, clock
 const NO = 6 + F + KE;           // split, share, write gate, write amt, aim[F], mem[2], effect gates[KE]
 const P = NI * HMAX + HMAX + HMAX * NO + NO;
-const HDR = 8;                   // H, range, mutRate, hue, lineage, generation, maxAge, clockFreq
+const HDR = 10;                  // H, range, mutRate, hue, lineage, generation, maxAge, clockFreq, learning rate, bond key
 const EOFF = HDR + 3 * F;        // chemistry: absorb[F], energy gain[F], push[F]
 const WOFF = EOFF + 4 * KE;      // effects: (type|chanA<<8|chanB<<16, p0, p1, p2) × KE
 const WWORDS = Math.ceil(P / 2); // weights as packed f16 pairs
 const GS = WOFF + WWORDS;        // u32 words per genome
 const GATHER_K = 64;             // genomes sampled per gene-bank pass
 const PLANT_MAX = 600;
+const PBYTES = 48;               // Particle struct size
+if ((NI * HMAX + HMAX) % 2 || NO % 2) throw new Error('plasticity expects W2 and NO to be even');
 
 function clampInt(v, lo, hi, d) { const n = parseInt(v, 10); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : d; }
 const $ = id => document.getElementById(id);
@@ -31,6 +34,7 @@ function fail(msg) { console.error(msg); const e = $('err'); e.textContent = msg
 const common = (N) => /* wgsl */`
 const F: u32 = ${F}u;
 const FS: u32 = ${FS}u;
+const FX: u32 = ${FX}u;
 const KE: u32 = ${KE}u;
 const NT: u32 = ${NT}u;
 const HMAX: u32 = ${HMAX}u;
@@ -53,7 +57,7 @@ const GATE0: u32 = ${6 + F}u;
 const DSCALE: f32 = 262144.0;
 const INFO_GAIN: f32 = 10.0;
 
-struct Particle { pos: vec2f, vel: vec2f, energy: f32, age: f32, alive: u32, kids: u32, mem: vec2f };
+struct Particle { pos: vec2f, vel: vec2f, energy: f32, age: f32, alive: u32, kids: u32, mem: vec2f, rbar: f32, pad: f32 };
 
 fn wrapD(d: vec2f) -> vec2f { return d - round(d / GF) * GF; }
 fn wrapP(p: vec2f) -> vec2f { return p - floor(p / GF) * GF; }
@@ -85,9 +89,10 @@ struct U {
 @group(0) @binding(5) var<storage, read_write> deposit: array<atomic<i32>>;
 @group(0) @binding(6) var<storage, read_write> reqs: array<vec2u>;      // split requests; also host upload area
 @group(0) @binding(7) var<storage, read_write> freeList: array<u32>;   // free slots; also host download area
-@group(0) @binding(8) var<storage, read_write> counters: array<atomic<u32>, 32>;
+@group(0) @binding(8) var<storage, read_write> counters: array<atomic<u32>, 48>;
 // counters: 0 split requests, 1 free slots, 2 alive, 3 births (total), 4 deaths (total),
 //           5 sum active params, 6 sum hidden width, 7 max generation, 8 step counter, 9 lineages seeded,
+//           11 gene uptakes (total), 12 gene injections (total), 13 bonded particles, 14 learners,
 //           16..16+NT effect-type histogram (slots in living particles)
 
 var<private> rs: u32;
@@ -109,11 +114,16 @@ fn wt(s: u32, k: u32) -> f32 {
   return select(w.x, w.y, (k & 1u) == 1u);
 }
 fn uploadWord(w: u32) -> u32 { let v = reqs[w >> 1u]; return select(v.x, v.y, (w & 1u) == 1u); }
-fn dep(cell: u32, c: u32, v: f32) { atomicAdd(&deposit[cell * FS + c], i32(round(v * DSCALE))); }
+fn dep(cell: u32, c: u32, v: f32) { atomicAdd(&deposit[cell * FX + c], i32(round(v * DSCALE))); }
 fn chanValue(c: u32) -> f32 { return select(1.0 / INFO_GAIN, 1.0, c == 0u); } // energy per unit in channel c
 fn activeParams(h: u32) -> u32 { return NI * h + h + h * NO + NO; }
 fn stepSeed(salt: u32) -> u32 { return pcg(atomicLoad(&counters[8]) * 2654435761u + salt); }
 fn packEffect(t: u32, a: u32, b: u32) -> u32 { return t | (a << 8u) | (b << 16u); }
+// who occupied this cell last step (slot + 1, 0 = nobody); written via atomicMax, carried in the field's last slot
+fn occupant(cell: u32) -> u32 { return bitcast<u32>(field[cell * FX + FS]); }
+fn copyEffect(srcSlot: u32, srcGene: u32, dstSlot: u32, dstGene: u32) {
+  for (var w = 0u; w < 4u; w++) { sw(dstSlot, EOFF + dstGene * 4u + w, gw(srcSlot, EOFF + srcGene * 4u + w)); }
+}
 
 @compute @workgroup_size(1)
 fn reset() {
@@ -123,6 +133,8 @@ fn reset() {
   atomicStore(&counters[5], 0u);
   atomicStore(&counters[6], 0u);
   atomicStore(&counters[7], 0u);
+  atomicStore(&counters[13], 0u);
+  atomicStore(&counters[14], 0u);
   for (var t = 0u; t < NT; t++) { atomicStore(&counters[16u + t], 0u); }
   atomicAdd(&counters[8], 1u);
 }
@@ -136,6 +148,8 @@ fn randomGenome(b: u32, lineage: u32) {
   sw(b, 5u, 0u);                             // generation
   sf(b, 6u, 500.0 + rnd() * 2500.0);         // max age (steps)
   sf(b, 7u, 0.01 + rnd() * 0.2);             // internal clock frequency
+  sf(b, 8u, select(0.0, rnd() * 0.05, rnd() < 0.5)); // within-life learning rate (0 = innate only)
+  sw(b, 9u, pcg(lineage ^ 0x5bd1e995u));     // bond key (kin recognition)
   for (var c = 0u; c < F; c++) {
     sf(b, HDR + c, select(rnd() * 0.12, 0.02 + rnd() * 0.1, c == 0u));          // absorb rate
     sf(b, HDR + F + c, select(rndn() * 0.5, 0.5 + rnd() * 0.5, c == 0u));       // energy per unit absorbed
@@ -162,6 +176,8 @@ fn newParticle(pos: vec2f, energy: f32) -> Particle {
   p.alive = 1u;
   p.kids = 0u;
   p.mem = vec2f(0.0);
+  p.rbar = 0.0;
+  p.pad = 0.0;
   return p;
 }
 
@@ -211,8 +227,8 @@ fn step(@builtin(global_invocation_id) gid: vec3u) {
   var val: array<f32, ${FS}>;
   var grd: array<vec2f, ${FS}>;
   for (var c = 0u; c < FS; c++) {
-    let v = field[here * FS + c];
-    let g = vec2f(field[cr * FS + c] - field[cl * FS + c], field[cu * FS + c] - field[cd * FS + c]) * inv;
+    let v = field[here * FX + c];
+    let g = vec2f(field[cr * FX + c] - field[cl * FX + c], field[cu * FX + c] - field[cd * FX + c]) * inv;
     val[c] = v; grd[c] = g;
     let k = select(1.0, 0.3, c == F);
     inp[c] = v * k;
@@ -259,11 +275,12 @@ fn step(@builtin(global_invocation_id) gid: vec3u) {
     let cs = min(ca, F - 1u);                     // ca restricted to real channels
     let p0 = gf(b, base + 1u);
     let p1 = gf(b, base + 2u);
+    let p2 = gf(b, base + 3u);
     let gate = sig(o[GATE0 + s]);
     // re-read from the (cache-hot) field rather than dynamically indexing private arrays, which spills them
-    let vA = field[here * FS + ca];
-    let vS = field[here * FS + cs];
-    let ga = vec2f(field[cr * FS + ca] - field[cl * FS + ca], field[cu * FS + ca] - field[cd * FS + ca]) * inv;
+    let vA = field[here * FX + ca];
+    let vS = field[here * FX + cs];
+    let ga = vec2f(field[cr * FX + ca] - field[cl * FX + ca], field[cu * FX + ca] - field[cd * FX + ca]) * inv;
     let na = ga / (length(ga) + 0.01);
     e -= 0.00008;                                 // upkeep per expressed effect
     switch t {
@@ -297,7 +314,7 @@ fn step(@builtin(global_invocation_id) gid: vec3u) {
       case 9u: {                                                              // siphon a at sensing range
         let off = na * f32(r);
         let fc = cellIdx(x + i32(round(off.x)), y + i32(round(off.y)));
-        let amt = clamp(abs(p0), 0.0, 1.0) * gate * 0.15 * max(field[fc * FS + cs], 0.0);
+        let amt = clamp(abs(p0), 0.0, 1.0) * gate * 0.15 * max(field[fc * FX + cs], 0.0);
         dep(fc, cs, -amt);
         e += amt * chanValue(cs) * clamp(p1, 0.0, 1.0);
       }
@@ -312,6 +329,52 @@ fn step(@builtin(global_invocation_id) gid: vec3u) {
         e -= 0.0005 * shield;
       }
       case 13u: { force += abs(p0) * gate * vec2f(cos(p1 * 6.2832), sin(p1 * 6.2832)) * 0.3; } // drift
+      case 14u: {                                                             // uptake: copy a gene from whoever shares my cell
+        if (rnd() < clamp(abs(p0), 0.0, 1.0) * gate * 0.02) {
+          let d = occupant(here);
+          if (d > 0u && d - 1u != i && parts[d - 1u].alive == 1u) {
+            let j = d - 1u;
+            let dst = (s + 1u + min(u32(rnd() * f32(KE - 1u)), KE - 2u)) % KE;   // never overwrite this uptake gene
+            copyEffect(j, min(u32(rnd() * f32(KE)), KE - 1u), b, dst);
+            if (rnd() < 0.3) {                                                // plus a block of 16 weight words
+              let off = min(u32(rnd() * f32(WWORDS - 16u)), WWORDS - 16u);
+              for (var w = 0u; w < 16u; w++) { sw(b, WOFF + off + w, gw(j, WOFF + off + w)); }
+            }
+            e -= 0.002;
+            atomicAdd(&counters[11], 1u);
+          }
+        }
+      }
+      case 15u: {                                                             // inject: write this gene into a neighbour
+        if (rnd() < clamp(abs(p0), 0.0, 1.0) * gate * 0.02) {
+          let d = occupant(here);
+          if (d > 0u && d - 1u != i && parts[d - 1u].alive == 1u) {
+            copyEffect(b, s, d - 1u, min(u32(rnd() * f32(KE)), KE - 1u));
+            e -= 0.01;
+            atomicAdd(&counters[12], 1u);
+          }
+        }
+      }
+      case 16u: {                                                             // bond: spring to kin with a matching key
+        let myKey = gw(b, 9u);
+        let tol = u32(clamp(abs(p1) * 4.0, 0.0, 8.0));
+        let rest = 0.8 + abs(p2);
+        var bonded = false;
+        for (var q = 0u; q < 5u; q++) {
+          let ox = select(select(select(select(0, 1, q == 1u), -1, q == 2u), 0, q == 3u), 0, q == 4u);
+          let oy = select(select(0, 1, q == 3u), -1, q == 4u);
+          let d = occupant(cellIdx(x + ox, y + oy));
+          if (d == 0u || d - 1u == i) { continue; }
+          let j = d - 1u;
+          if (parts[j].alive == 0u || countOneBits(myKey ^ gw(j, 9u)) > tol) { continue; }
+          let dv = wrapD(parts[j].pos - p.pos);
+          let dist = max(length(dv), 1e-3);
+          force += (dv / dist) * (dist - rest) * abs(p0) * gate * 1.5;
+          force += (parts[j].vel - p.vel) * gate * 0.8;
+          bonded = true;
+        }
+        if (bonded) { atomicAdd(&counters[13], 1u); }
+      }
       default: {}
     }
   }
@@ -361,26 +424,45 @@ fn step(@builtin(global_invocation_id) gid: vec3u) {
 
   // --- move: chemistry + effects + baseline incompressibility ---
   // surface tension: short-range pressure (range 1) against cohesion at the evolved sensing range -> droplets
-  let g1 = vec2f(field[cellIdx(x + 1, y) * FS + F] - field[cellIdx(x - 1, y) * FS + F],
-                 field[cellIdx(x, y + 1) * FS + F] - field[cellIdx(x, y - 1) * FS + F]) * 0.5;
+  let g1 = vec2f(field[cellIdx(x + 1, y) * FX + F] - field[cellIdx(x - 1, y) * FX + F],
+                 field[cellIdx(x, y + 1) * FX + F] - field[cellIdx(x, y - 1) * FX + F]) * 0.5;
   force -= u.pressure * g1 / (length(g1) * 0.25 + 1.0);
   force += u.cohesion * gDen / (length(gDen) + 0.05);
   var v = p.vel * 0.85 + push * 0.25 + force * 0.12 + vec2f(rnd() - 0.5, rnd() - 0.5) * (0.04 + heat);
   v *= 1.0 - anchor * 0.9;
   let sp = length(v);
   if (sp > 1.2) { v = v * (1.2 / sp); }
+  // --- learn: reward-modulated Hebbian update of this net's hidden->output weights (Lamarckian: children inherit them) ---
+  let eta = gf(b, 8u);
+  let dE = e - p.energy;
+  if (eta > 0.0005 && ((i + atomicLoad(&counters[8])) & 1u) == 0u) {
+    let m = tanh((dE - p.rbar) * 40.0);
+    let lr = eta * m;
+    for (var h = 0u; h < H; h++) {
+      let hh = lr * hid[h];
+      for (var k = 0u; k < NO; k += 2u) {
+        let wi = (WOFF + ((W2 + h * NO + k) >> 1u)) * N + b;
+        let w = unpack2x16float(genome[wi]) + hh * vec2f(tanh(o[k]), tanh(o[k + 1u]));
+        genome[wi] = pack2x16float(clamp(w, vec2f(-8.0), vec2f(8.0)));
+      }
+    }
+  }
+  p.rbar = p.rbar * 0.95 + dE * 0.05;
+
   p.vel = v;
   p.pos = wrapP(p.pos + v);
   p.energy = e;
   parts[i] = p;
   // occupancy for the density channel (at the new position)
-  atomicAdd(&deposit[cellIdx(i32(floor(p.pos.x)), i32(floor(p.pos.y))) * FS + F], i32(DSCALE));
+  let nc = cellIdx(i32(floor(p.pos.x)), i32(floor(p.pos.y)));
+  atomicAdd(&deposit[nc * FX + F], i32(DSCALE));
+  atomicMax(&deposit[nc * FX + FS], i32(i + 1u));
 }
 
-var<workgroup> wsum: array<atomic<u32>, ${4 + NT}>;
+var<workgroup> wsum: array<atomic<u32>, ${5 + NT}>;
 @compute @workgroup_size(128)
 fn collect(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_index) li: u32) {
-  if (li < ${4 + NT}u) { atomicStore(&wsum[li], 0u); }
+  if (li < ${5 + NT}u) { atomicStore(&wsum[li], 0u); }
   workgroupBarrier();
   let i = gid.x;
   if (i < N) {
@@ -393,9 +475,10 @@ fn collect(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_
       atomicAdd(&wsum[1], activeParams(h));
       atomicAdd(&wsum[2], h);
       atomicMax(&wsum[3], gw(i, 5u));
+      if (gf(i, 8u) > 0.0005) { atomicAdd(&wsum[4], 1u); }
       for (var s = 0u; s < KE; s++) {
         let t = min(gw(i, EOFF + s * 4u) & 255u, NT - 1u);
-        atomicAdd(&wsum[4u + t], 1u);
+        atomicAdd(&wsum[5u + t], 1u);
       }
     }
   }
@@ -405,8 +488,9 @@ fn collect(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_
     atomicAdd(&counters[5], atomicLoad(&wsum[1]));
     atomicAdd(&counters[6], atomicLoad(&wsum[2]));
     atomicMax(&counters[7], atomicLoad(&wsum[3]));
+    atomicAdd(&counters[14], atomicLoad(&wsum[4]));
   }
-  if (li >= 4u && li < ${4 + NT}u) { atomicAdd(&counters[12u + li], atomicLoad(&wsum[li])); }
+  if (li >= 5u && li < ${5 + NT}u) { atomicAdd(&counters[11u + li], atomicLoad(&wsum[li])); }
 }
 
 // Copies genome sb into db with mutation. Works in place (sb == db) since each word is read before written.
@@ -428,6 +512,12 @@ fn mutateCopy(sb: u32, db: u32) {
   sw(db, 5u, gw(sb, 5u) + 1u);
   sf(db, 6u, clamp(gf(sb, 6u) * exp(rndn() * 0.05 * u.mutScale), 150.0, 8000.0));
   sf(db, 7u, clamp(gf(sb, 7u) * exp(rndn() * m), 0.002, 1.0));
+  var eta = gf(sb, 8u);
+  if (rnd() < 0.02 * u.mutScale) { eta = select(rnd() * 0.03, 0.0, eta > 0.0); } else { eta = eta * exp(rndn() * m); }
+  sf(db, 8u, clamp(eta, 0.0, 0.2));
+  var key = gw(sb, 9u);
+  if (rnd() < 0.02 * u.mutScale) { key = key ^ (1u << min(u32(rnd() * 32.0), 31u)); }
+  sw(db, 9u, key);
   for (var c = 0u; c < F; c++) {
     let k = HDR + c;
     sf(db, k, clamp(gf(sb, k) + rndn() * m * 0.08, 0.0, 0.25));
@@ -523,12 +613,13 @@ fn fieldStep(@builtin(global_invocation_id) gid: vec3u) {
     let d = wrapD(wp - S.xy);
     sun += S.w * exp(-dot(d, d) / (S.z * S.z));
   }
+  fieldOut[id * FX + FS] = bitcast<f32>(u32(atomicExchange(&deposit[id * FX + FS], 0)));   // occupant id
   for (var c = 0u; c < FS; c++) {
-    let v = field[id * FS + c];
-    let lap = field[l * FS + c] + field[r * FS + c] + field[dn * FS + c] + field[up * FS + c] - 4.0 * v;
-    let d = f32(atomicExchange(&deposit[id * FS + c], 0)) / DSCALE;
+    let v = field[id * FX + c];
+    let lap = field[l * FX + c] + field[r * FX + c] + field[dn * FX + c] + field[up * FX + c] - 4.0 * v;
+    let d = f32(atomicExchange(&deposit[id * FX + c], 0)) / DSCALE;
     if (c == F) {                          // density: current occupancy, lightly smoothed
-      fieldOut[id * FS + c] = clamp(d * 0.6 + (v + 0.2 * lap) * 0.4, 0.0, 64.0);
+      fieldOut[id * FX + c] = clamp(d * 0.6 + (v + 0.2 * lap) * 0.4, 0.0, 64.0);
       continue;
     }
     let fc = f32(c) / f32(F);
@@ -536,7 +627,7 @@ fn fieldStep(@builtin(global_invocation_id) gid: vec3u) {
     let decay = select(0.004 + 0.03 * fract(fc * 1.618 + 0.1), 0.0006, c == 0u);
     var nv = v + diff * lap - decay * v + d;
     if (c == 0u) { nv += sun * u.sun; }
-    fieldOut[id * FS + c] = clamp(nv, 0.0, 4.0);
+    fieldOut[id * FX + c] = clamp(nv, 0.0, 4.0);
   }
 }
 `;
@@ -557,7 +648,7 @@ fn pal(c: u32) -> vec3f {
   if (c == 0u) { return vec3f(0.55, 0.42, 0.08); }
   return hsv(fract(f32(c - 1u) / f32(F - 1u) + 0.45), 0.85, 1.0);
 }
-fn fval(cell: u32, c: u32) -> f32 { return field[cell * FS + c]; }
+fn fval(cell: u32, c: u32) -> f32 { return field[cell * FX + c]; }
 
 @fragment fn fsField(@builtin(position) fc: vec4f) -> @location(0) vec4f {
   if (cam.mode == 1u) { return vec4f(0.0, 0.0, 0.0, 1.0); }
@@ -652,7 +743,7 @@ function decodeGenome(g) {
       p0: asF32(g[EOFF + s * 4 + 1]), p1: asF32(g[EOFF + s * 4 + 2]) });
   }
   return { H, params: NI * H + H + H * NO + NO, range: asF32(g[1]), mut: asF32(g[2]), hue: asF32(g[3]),
-    lineage: g[4] >>> 0, gen: g[5], maxAge: asF32(g[6]), clock: asF32(g[7]), chem, effects };
+    lineage: g[4] >>> 0, gen: g[5], maxAge: asF32(g[6]), clock: asF32(g[7]), eta: asF32(g[8]), key: g[9] >>> 0, chem, effects };
 }
 
 function embed(g, d) {
@@ -661,7 +752,7 @@ function embed(g, d) {
   const eff = new Array(NT).fill(0);
   for (const e of d.effects) if (e.t > 0) eff[e.t] += Math.min(Math.abs(e.p0), 1.5);
   v.push(...eff.slice(1).map(x => x * 0.8));
-  v.push(d.range / 10, d.H / HMAX, Math.min(d.clock, 1));
+  v.push(d.range / 10, d.H / HMAX, Math.min(d.clock, 1), Math.min(d.eta * 20, 2));
   const w = new Float32Array(P);
   for (let k = 0; k < WWORDS; k++) { const u = g[WOFF + k]; w[2 * k] = f16(u & 0xffff); if (2 * k + 1 < P) w[2 * k + 1] = f16(u >>> 16); }
   const norm = 1 / Math.sqrt(P);
@@ -737,7 +828,7 @@ class GeneBank {
     return X.map(x => comps.map(c => x.reduce((s, xi, i) => s + xi * c[i], 0)));
   }
   serialize() {
-    return JSON.stringify({ v: 2, F, HMAX, GS, radius: this.radius, entries: this.entries.map(e => ({
+    return JSON.stringify({ v: 3, F, HMAX, GS, radius: this.radius, entries: this.entries.map(e => ({
       id: e.id, fitness: e.fitness, kids: e.kids, g: btoa(String.fromCharCode(...new Uint8Array(e.genome.buffer))) })) });
   }
   load(json) {
@@ -762,7 +853,7 @@ async function main() {
   const maxBind = Math.min(lim.maxStorageBufferBindingSize, lim.maxBufferSize);
   let N = Math.min(N_REQ, Math.floor(maxBind / (GS * 4)));
   N = Math.floor(N / 128) * 128;
-  if (G * G * FS * 4 > maxBind) return fail(`Field ${G}×${G}×${FS} exceeds this GPU's buffer limit.`);
+  if (G * G * FX * 4 > maxBind) return fail(`Field ${G}×${G}×${FX} exceeds this GPU's buffer limit.`);
   const ainfo = adapter.info || {};
   console.log('adapter', ainfo.vendor, ainfo.architecture, ainfo.description, 'N', N, 'GS', GS, 'P', P);
   const device = await adapter.requestDevice({
@@ -793,14 +884,14 @@ async function main() {
   const UBYTES = 64 + SOURCES * 16;
   const uni = buf(UBYTES, GPUBufferUsage.UNIFORM | CD);
   const camBuf = buf(32, GPUBufferUsage.UNIFORM | CD);
-  const parts = buf(N * 40, S | CD);
+  const parts = buf(N * PBYTES, S | CD);
   const genome = buf(N * GS * 4, S | CD);
-  const fieldBufs = [buf(G * G * FS * 4, S | CD | CS), buf(G * G * FS * 4, S | CD | CS)];
-  const deposit = buf(G * G * FS * 4, S | CD);
+  const fieldBufs = [buf(G * G * FX * 4, S | CD | CS), buf(G * G * FX * 4, S | CD | CS)];
+  const deposit = buf(G * G * FX * 4, S | CD);
   const reqs = buf(Math.max(N * 8, GS * 4 + 16), S | CD);
   const freeList = buf(Math.max(N * 4, (GATHER_K * (GS + 4)) * 4), S | CS);
-  const counters = buf(128, S | CS | CD);
-  const staging = buf(128, GPUBufferUsage.MAP_READ | CD);
+  const counters = buf(192, S | CS | CD);
+  const staging = buf(192, GPUBufferUsage.MAP_READ | CD);
   const GATHER_BYTES = GATHER_K * (GS + 4) * 4;
   const gatherRead = buf(GATHER_BYTES, GPUBufferUsage.MAP_READ | CD);
 
@@ -860,10 +951,10 @@ async function main() {
   let tool = 'erase';
   const cam = { cx: G / 2, cy: G / 2, scale: 1 };
   const mouse = { x: 0, y: 0, down: false, panning: false, lx: 0, ly: 0 };
-  const stats = { alive: 0, births: 0, deaths: 0, params: 0, hidden: 0, gen: 0, effects: new Array(NT).fill(0), pending: false };
+  const stats = { alive: 0, births: 0, deaths: 0, params: 0, hidden: 0, gen: 0, uptakes: 0, injections: 0, bonded: 0, learners: 0, effects: new Array(NT).fill(0), pending: false };
   let stepsDone = 0, stepRate = 0, fps = 0, rateT = performance.now(), rateSteps = 0, rateFrames = 0;
   const bank = new GeneBank();
-  const BANK_KEY = `fieldlife-bank-v2-F${F}-H${HMAX}`;
+  const BANK_KEY = `fieldlife-bank-v3-F${F}-H${HMAX}`;
   try { const saved = localStorage.getItem(BANK_KEY); if (saved && !qs.has('fresh')) bank.load(saved); } catch (e) { console.warn('gene bank not restored', e); }
   let selected = null;
   const plantQ = [];            // { genome, x, y, r, count, stage }
@@ -1022,13 +1113,14 @@ async function main() {
     const ch = c => (c >= F ? 'ρ' : c === 0 ? 'E' : 'c' + c);
     const effs = d.effects.filter(e => e.t > 0).map(e => {
       const n = EFFECTS[e.t];
-      const two = ['catalyse', 'relay'].includes(n) ? `${ch(Math.min(e.a, F - 1))}→${ch(e.b)}` : ['pulse'].includes(n) ? `→${ch(e.b)}` : ['jet', 'anchor', 'heat', 'shield', 'drift'].includes(n) ? '' : ch(e.a);
+      const two = ['catalyse', 'relay'].includes(n) ? `${ch(Math.min(e.a, F - 1))}→${ch(e.b)}` : ['pulse'].includes(n) ? `→${ch(e.b)}` : ['jet', 'anchor', 'heat', 'shield', 'drift', 'uptake', 'inject', 'bond'].includes(n) ? '' : ch(e.a);
       return `${n}${two ? '(' + two + ')' : ''} ${e.p0 >= 0 ? '+' : ''}${e.p0.toFixed(2)}`;
     });
     const eats = d.chem.egain.map((g, c) => [g * d.chem.absorb[c], c]).sort((a, b) => b[0] - a[0]);
     $('species').textContent =
       `#${selected.id}  gen ${d.gen}  kids ${selected.kids}  fit ${selected.fitness.toFixed(1)}\n` +
       `net ${NI}→${d.H}→${NO} (${d.params} params)  range ${d.range.toFixed(1)}\n` +
+      `learning ${d.eta > 0.0005 ? 'η ' + d.eta.toFixed(3) : 'innate only'}  bond key ${d.key.toString(16).padStart(8, '0')}\n` +
       `effects: ${effs.join(', ') || 'none'}\n` +
       `feeds on ${eats.slice(0, 2).map(([, c]) => ch(c)).join(', ')}; poisoned by ${eats.slice(-1).map(([, c]) => ch(c)).join('')}`;
   }
@@ -1165,7 +1257,7 @@ async function main() {
     rp.end();
 
     const readStats = !stats.pending && frameNo % 6 === 0;
-    if (readStats) enc.copyBufferToBuffer(counters, 0, staging, 0, 128);
+    if (readStats) enc.copyBufferToBuffer(counters, 0, staging, 0, 192);
     device.queue.submit([enc.finish()]);
     if (readStats) {
       stats.pending = true;
@@ -1175,6 +1267,7 @@ async function main() {
         stats.alive = c[2]; stats.births = c[3]; stats.deaths = c[4];
         stats.params = c[2] ? c[5] / c[2] : 0; stats.hidden = c[2] ? c[6] / c[2] : 0; stats.gen = c[7];
         stats.effects = Array.from(c.slice(16, 16 + NT));
+        stats.uptakes = c[11]; stats.injections = c[12]; stats.bonded = c[13]; stats.learners = c[14];
         stats.pending = false;
       });
     }
@@ -1191,7 +1284,10 @@ async function main() {
         `max gen    ${stats.gen}\n` +
         `births     ${stats.births.toLocaleString()}\n` +
         `deaths     ${stats.deaths.toLocaleString()}\n` +
-        `weights    ${(stats.alive * stats.params / 1e6).toFixed(1)}M live`;
+        `weights    ${(stats.alive * stats.params / 1e6).toFixed(1)}M live\n` +
+        `learners   ${stats.alive ? (100 * stats.learners / stats.alive).toFixed(0) : 0}% learn within life\n` +
+        `bonded     ${stats.bonded.toLocaleString()} this step\n` +
+        `genes      ${stats.uptakes.toLocaleString()} taken · ${stats.injections.toLocaleString()} injected`;
       const tot = Math.max(1, stats.alive * KE);
       $('effects').textContent = EFFECTS.map((n, t) => [n, stats.effects[t] / tot]).filter(([n]) => n !== 'none')
         .sort((a, b) => b[1] - a[1])
@@ -1204,7 +1300,7 @@ async function main() {
 
   // Debug helpers (used by headless checks).
   async function fieldSummary() {
-    const size = G * G * FS * 4;
+    const size = G * G * FX * 4;
     const rb = device.createBuffer({ size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     const enc = device.createCommandEncoder();
     enc.copyBufferToBuffer(fieldBufs[cur], 0, rb, 0, size);
@@ -1212,7 +1308,7 @@ async function main() {
     await rb.mapAsync(GPUMapMode.READ);
     const f = new Float32Array(rb.getMappedRange());
     const mean = new Array(FS).fill(0), max = new Array(FS).fill(0);
-    for (let i = 0; i < f.length; i++) { const c = i % FS; mean[c] += f[i]; if (f[i] > max[c]) max[c] = f[i]; }
+    for (let i = 0; i < f.length; i++) { const c = i % FX; if (c >= FS) continue; mean[c] += f[i]; if (f[i] > max[c]) max[c] = f[i]; }
     rb.unmap(); rb.destroy();
     return { mean: mean.map(m => +(m / (G * G)).toFixed(4)), max: max.map(m => +m.toFixed(3)) };
   }
