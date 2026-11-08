@@ -11,7 +11,8 @@ const { validateGenome, GeneBank } = makeGenomeTools(L);
 const MAX_PER_POST = 16;
 const MAX_FITNESS = 64;                                 // claims can't be verified, so they are capped...
 const HALF_LIFE_MS = 6 * 3600 * 1000;                   // ...and decay, so stale or inflated entries get displaced
-const POST_INTERVAL_MS = 20_000;                        // per client address
+const POST_INTERVAL_MS = 20_000;                        // per session
+const IP_POSTS_PER_MIN = 12;                            // per client address (households and offices share one)
 const GLOBAL_INSERTS_PER_MIN = 600;
 const ONLINE_WINDOW_MS = 90_000;
 const BODY_LIMIT = 96 * 1024;
@@ -21,7 +22,8 @@ const HEX8 = /^[0-9a-f]{8}$/;
 export function createSharedBank({ dataDir }) {
   const bank = new GeneBank({ cap: 400, halfLifeMs: HALF_LIFE_MS, fastPrune: true });
   const file = join(dataDir, 'bank.json');
-  const lastPost = new Map();      // ip -> ms
+  const lastPost = new Map();      // session (or ip) -> ms
+  const ipPosts = new Map();       // ip -> [window start, count]
   const seen = new Map();          // session id -> ms
   let dirty = false, insertsThisMinute = 0, minuteStart = Date.now(), contributors = new Set();
   const strains = new Map();       // strain tag (hex) -> { work, bestGen, first, last, visitors }
@@ -75,13 +77,18 @@ export function createSharedBank({ dataDir }) {
 
   function accept(body, ip) {
     const now = Date.now();
-    if (now - (lastPost.get(ip) || 0) < POST_INTERVAL_MS) return { status: 429, body: { error: 'Too many uploads; try again shortly.' } };
+    const who = typeof body?.sid === 'string' && /^[a-z0-9]{8,32}$/.test(body.sid) ? 's:' + body.sid : 'i:' + ip;
+    if (now - (lastPost.get(who) || 0) < POST_INTERVAL_MS) return { status: 429, body: { error: 'Too many uploads; try again shortly.' } };
+    const win = ipPosts.get(ip);
+    if (win && now - win[0] < 60_000 && win[1] >= IP_POSTS_PER_MIN) return { status: 429, body: { error: 'Too many uploads from this address.' } };
+    if (!win || now - win[0] >= 60_000) ipPosts.set(ip, [now, 1]); else win[1]++;
+    if (ipPosts.size > 10_000) for (const [k, w] of ipPosts) if (now - w[0] > 60_000) ipPosts.delete(k);
     if (now - minuteStart > 60_000) { minuteStart = now; insertsThisMinute = 0; }
     if (insertsThisMinute >= GLOBAL_INSERTS_PER_MIN) return { status: 429, body: { error: 'The shared bank is busy.' } };
     if (!body || body.F !== SHARED_F || body.HMAX !== SHARED_HMAX || body.GS !== L.GS || !Array.isArray(body.entries)) {
       return { status: 400, body: { error: 'Wrong configuration.' } };
     }
-    lastPost.set(ip, now);
+    lastPost.set(who, now);
     if (lastPost.size > 10_000) for (const [k, t] of lastPost) if (now - t > POST_INTERVAL_MS) lastPost.delete(k);
     let accepted = 0, rejected = 0, kept = 0;
     const good = [];
@@ -122,5 +129,27 @@ export function createSharedBank({ dataDir }) {
     return { status: 200, body: { accepted, rejected, kept, niches: bank.entries.length } };
   }
 
-  return { load, save, list, accept, BODY_LIMIT };
+  // for the shared world: a strain's record (node, work) and its champion genome (fittest archived net carrying its tag)
+  const strainOf = tag => strains.get(tag) || null;
+  // a strain becomes known to the world as soon as its viewer reports in (not only after a bank upload lands)
+  function touch(tag, node) {
+    if (!HEX8.test(tag || '')) return;
+    const now = Date.now();
+    let st = strains.get(tag);
+    if (!st) { st = { work: 0, bestGen: 0, first: now, last: now, visitors: 1 }; strains.set(tag, st); dirty = true; }
+    st.last = now;
+    if (node && Number.isFinite(node.x) && Number.isFinite(node.y) && node.x >= 0 && node.x < 1 && node.y >= 0 && node.y < 1) {
+      st.node = { x: Math.round(node.x * 1e4) / 1e4, y: Math.round(node.y * 1e4) / 1e4, chosen: !!node.chosen };
+    }
+  }
+  function champions(tags) {
+    const want = new Set(tags.filter(t => HEX8.test(t)).slice(0, 48)), best = new Map();
+    for (const e of bank.entries) {
+      const t = (e.dec.lineage >>> 0).toString(16).padStart(8, '0');
+      if (want.has(t) && (!best.has(t) || e.fitness > best.get(t).fitness)) best.set(t, e);
+    }
+    return Object.fromEntries([...best].map(([t, e]) => [t, genomeToB64(e.genome)]));
+  }
+
+  return { load, save, list, accept, strainOf, touch, champions, BODY_LIMIT };
 }

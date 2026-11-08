@@ -3,11 +3,14 @@ import { readFile } from 'node:fs/promises';
 import { extname, join, normalize, relative } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { createSharedBank } from './shared-bank.js';
+import { createWorld } from './world.js';
 
 const root = join(process.cwd(), 'public');
 const sharedBank = createSharedBank({ dataDir: process.env.DATA_DIR || join(process.cwd(), 'data') });
 await sharedBank.load();
-for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, async () => { await sharedBank.save(); process.exit(0); });
+const world = createWorld({ dataDir: process.env.DATA_DIR || join(process.cwd(), 'data'), strainOf: sharedBank.strainOf, touch: sharedBank.touch });
+await world.load();
+for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, async () => { await sharedBank.save(); await world.save(); process.exit(0); });
 
 const types = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg' };
 const questions = {
@@ -44,6 +47,27 @@ async function critique(req, res) {
   } catch (error) { return send(res, 502, { error: error.message }); }
 }
 
+async function readJson(req, limit) {
+  let body = '';
+  for await (const chunk of req) { body += chunk; if (body.length > limit) return { error: 413 }; }
+  try { return { value: JSON.parse(body) }; } catch { return { error: 400 }; }
+}
+
+async function worldApi(req, res, url) {
+  if (url.pathname === '/api/world' && req.method === 'GET') return send(res, 200, world.state());
+  if (url.pathname === '/api/world/genomes' && req.method === 'GET') {
+    return send(res, 200, sharedBank.champions((url.searchParams.get('tags') || '').split(',')));
+  }
+  if (url.pathname === '/api/world/observe' && req.method === 'POST') {
+    if (!/^application\/json/.test(req.headers['content-type'] || '')) return send(res, 415, { error: 'Send JSON.' });
+    const r = await readJson(req, 64 * 1024);
+    if (r.error) return send(res, r.error, { error: r.error === 413 ? 'Too large.' : 'Invalid JSON.' });
+    const out = world.observe(r.value, String(req.headers['cf-connecting-ip'] || req.socket.remoteAddress || ''));
+    return send(res, out.status, out.body);
+  }
+  return send(res, 404, { error: 'Not found.' });
+}
+
 async function bankApi(req, res, url) {
   if (req.method === 'GET') {
     const since = Math.max(0, Number(url.searchParams.get('since')) || 0);
@@ -74,6 +98,7 @@ const server = createServer(async (req, res) => {
   if (req.url === '/healthz') return send(res, 200, { ok: true });
   const url = new URL(req.url ?? '/', 'http://localhost');
   if (url.pathname === '/api/bank') return bankApi(req, res, url);
+  if (url.pathname.startsWith('/api/world')) return worldApi(req, res, url);
   if (req.url === '/api/status' && req.method === 'GET') return send(res, 200, { jevConfigured: Boolean(process.env.TYPESAFE_API_KEY) });
   if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, { error: 'Method not allowed.' });
   const pathname = decodeURIComponent((req.url ?? '/').split('?')[0]);

@@ -14,6 +14,7 @@
     :root { --fg: #d8f0e0; --dim: #7a8a80; --panel: rgba(8, 10, 12, 0.84); --line: rgba(255,255,255,0.12); --acc: #6fe3a8; --amber: #f7cf5a; }
     html, body { margin: 0; height: 100%; background: #000; color: var(--fg); font: 12px/1.4 ui-monospace, Consolas, monospace; overflow: hidden; }
     #c { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; cursor: crosshair; touch-action: none; }
+    #terrview { position: fixed; inset: 0; width: 100vw; height: 100vh; pointer-events: none; mix-blend-mode: screen; }
     #hud { position: fixed; top: 6px; left: 8px; pointer-events: none; text-shadow: 0 0 3px #000, 0 0 3px #000; white-space: pre; }
     #panel { position: fixed; top: 8px; right: 8px; width: 284px; max-height: calc(100vh - 16px); overflow-y: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; backdrop-filter: blur(6px); box-sizing: border-box; }
     #panel.collapsed > :not(header) { display: none; }
@@ -37,6 +38,8 @@
     .strain { display: flex; gap: 10px; align-items: center; }
     #thumb { width: 40px; height: 40px; image-rendering: pixelated; border: 1px solid rgba(247,207,90,.4); border-radius: 4px; background: #050607; padding: 3px; flex: none; }
     #online { color: var(--dim); margin: 4px 0; }
+    #events { margin: 4px 0; font-size: 11px; }
+    #territory { margin-bottom: 4px; }
     .srow { display: flex; align-items: center; gap: 6px; padding: 1px 0; }
     .srow b { color: var(--amber); font-weight: normal; }
     .srow .sw { width: 9px; height: 9px; border-radius: 2px; flex: none; }
@@ -70,6 +73,7 @@
 </head>
 <body>
   <canvas id="c"></canvas>
+  <canvas id="terrview" aria-hidden="true"></canvas>
   <div id="hud">starting…</div>
   <aside id="panel">
     <header><h1>AINT FARM<small>artificial intelligence neural training farm</small></h1><button id="collapse" type="button" title="Collapse">–</button></header>
@@ -118,6 +122,15 @@
     </div>
     <div id="stats"></div>
 
+    <h2>THE WORLD</h2>
+    <div id="territory" class="dim"></div>
+    <div id="board"></div>
+    <div id="events" class="dim"></div>
+    <div class="row">
+      <label class="check" title="Draw the shared territory over the dish"><input id="showTerritory" type="checkbox" checked> territory</label>
+      <label class="check" title="Re-seed regions of your dish with the champion of the strain that holds them, so your GPU fights the real borders"><input id="worldSync" type="checkbox" checked> mirror the world</label>
+    </div>
+
     <h2>YOUR STRAIN</h2>
     <div class="strain"><canvas id="thumb" width="40" height="40" title="Your strain's thumbprint, derived from this browser"></canvas><div id="strainInfo"></div></div>
     <div id="online"></div>
@@ -146,6 +159,7 @@
       <summary>how it works</summary>
       <p><b>aint farm</b> is an artificial intelligence neural training farm: an ant farm for AI. Every particle is its own neural net. Nets start random (untrained) and are never trained by gradients. Selection, and each particle's own lifetime learning, are what shape them.</p>
       <p><b>Your strain.</b> Your browser gets a permanent thumbprint: a strain tag, a colour, and a founder genome generated from it. About 40% of founders in your dish are your strain. Your strain is your GPU's champion: whenever your dish evolves a net that out-reproduces your strain's best, that net takes over your thumbprint. Descendants carry the tag forever. Their best genomes enter the shared gene bank, and each visit resumes from your strain's most advanced genome. The <i>GPU commit</i> slider sets how much of your card the farm uses. Every particle-step your GPU simulates is credited to your strain's score, and immigration into everyone's dish favours strains with more GPU work behind them. The longer you run, the further your strain evolves and spreads.</p>
+      <p><b>The world.</b> Everyone shares one living territory map, drawn over the dish like lichen. Strains spore at their node and creep outward, powered by the GPUs of their viewers who are watching right now. Your dish mirrors the world: each region is re-seeded with the champion of whoever holds it, so the real neural battles on your GPU happen along the shared borders. Your dish reports which strains it actually sees surviving where, weighted by your GPU's power, and those reports move the borders for everyone. A strain whose viewers leave slowly erodes unless its genes keep winning in other people's dishes. The most effective strain wins.</p>
       <p><b>Your node.</b> Every strain has one node: the spot in the world where it enters every visitor's dish. Yours is random until you place it with the <i>node</i> tool. The world map shows every strain's node, and all dishes share the same coordinates, so an immigrant from another visitor's strain always arrives at its node.</p>
       <p><b>The shared gene bank</b> is a vector database of evolved nets, one for all visitors. Every second your GPU samples genomes that have reproduced and embeds each as a 49-dim vector: chemistry, effects, architecture, and a fingerprint of its weights. A newcomer that lands in an existing niche replaces it only if it's fitter. Otherwise it opens a new niche. The map is a live PCA of that space.</p>
       <p>Particles never interact directly. They read, absorb from, and write to a shared field. Channel 0 is energy from drifting suns. Channels 1–7 are information. Hidden channels record density, who is in each cell, and energy left for kin.</p>

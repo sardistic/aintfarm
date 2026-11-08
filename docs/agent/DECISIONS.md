@@ -107,3 +107,22 @@ Uniforms gained `learnOn`, an `effectMask` (from `?off=`), and `founderBias` (th
 **Inspector.** It reuses the `gather` kernel with K=1 plus direct buffer copies of the particle and five field cells, so the particle buffer now needs `COPY_SRC`. The net's forward pass is recomputed on the CPU from the genome.
 
 **Auto-fit.** Sizing reloads the page at half N if the average fps over seconds 3–9 is below 22, up to 3 times per session, and stores the result in localStorage. An explicit `?n=` disables it.
+
+## 2026-11-08 — One shared world: territory battles powered by viewers' GPUs
+
+Every visitor ran a separate dish, so there was no shared live view. Running one deterministic simulation across browsers is not possible: GPUs differ in floating point and population size. Instead, the server holds a coarse, authoritative 64×64 territory map, and the browsers' GPUs act as the battle engines:
+- **Dishes mirror the map.** Owned regions are re-seeded with each owner's champion genome.
+- **Fights happen locally.** The neural-particle battles run on each viewer's GPU.
+- **Dishes report back.** Each dish reports which strains survive where, weighted by that GPU's measured throughput. The server folds those reports into the map, along with lichen-style growth from each strain's node that is driven by live viewer power.
+
+Everyone polls the same state, so everyone sees the same world.
+
+**Balance.**
+- Growth is contiguous: evidence can only claim cells adjacent to the strain's front.
+- A viewer's reports about its own strain count 30%, because a dish is mostly its viewer's strain.
+- Power is sqrt-saturating, so one fast GPU cannot steamroll.
+- Power fades about 12 s after the last report, and abandoned territory erodes. Survival therefore depends on watchers or on winning in other people's dishes.
+
+**Rate limiting.** It moved from per-IP to per-session (plus a per-IP minute cap), because visitors behind one address were starving each other.
+
+**Trust.** Reports are unauthenticated, so the server bounds rather than verifies them: rate caps, per-report totals, and registered strains only. A determined spoofer could still push territory. Acceptable for a toy; revisit if abused.

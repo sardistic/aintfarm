@@ -20,7 +20,8 @@ test('accepts valid genomes, rejects malformed ones, and rate-limits per address
   assert.equal(out.status, 200);
   assert.equal(out.body.accepted, 1);
   assert.equal(out.body.rejected, 2);
-  assert.equal(bank.accept({ ...base, entries: [] }, '1.1.1.1').status, 429);
+  assert.equal(bank.accept({ ...base, sid: 'sessionaaaa', entries: [] }, '1.1.1.1').status, 429, 'same session too soon');
+  assert.equal(bank.accept({ ...base, sid: 'sessionother', entries: [] }, '1.1.1.1').status, 200, 'another session behind the same address');
   assert.equal(bank.accept({ F: 4, HMAX: 12, GS: 1, entries: [] }, '2.2.2.2').status, 400);
 });
 

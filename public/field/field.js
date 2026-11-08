@@ -618,11 +618,13 @@ fn gather(@builtin(global_invocation_id) gid: vec3u) {
   freeList[t] = genome[w * N + slot];
   if (w == 0u) {
     let p = parts[slot];
-    let o = K * GS + j * 4u;
+    let o = K * GS + j * 6u;
     freeList[o] = p.alive;
     freeList[o + 1u] = p.kids;
     freeList[o + 2u] = bitcast<u32>(p.age);
     freeList[o + 3u] = bitcast<u32>(p.energy);
+    freeList[o + 4u] = bitcast<u32>(p.pos.x);
+    freeList[o + 5u] = bitcast<u32>(p.pos.y);
   }
 }
 
@@ -851,17 +853,17 @@ async function main() {
   const fieldBufs = [buf(G * G * FX * 4, S | CD | CS), buf(G * G * FX * 4, S | CD | CS)];
   const deposit = buf(G * G * FX * 4, S | CD);
   const reqs = buf(Math.max(N * 8, GS * 4 + 16), S | CD);
-  const freeList = buf(Math.max(N * 4, (GATHER_K * (GS + 4)) * 4), S | CS);
+  const freeList = buf(Math.max(N * 4, (GATHER_K * (GS + 6)) * 4), S | CS);
   const counters = buf(192, S | CS | CD);
   const tsSet = hasTS ? device.createQuerySet({ type: 'timestamp', count: 2 }) : null;
   const tsResolve = hasTS ? buf(16, GPUBufferUsage.QUERY_RESOLVE | CS) : null;
   const tsRead = hasTS ? buf(16, GPUBufferUsage.MAP_READ | CD) : null;
   let tsPending = false, simMs = 0;
   const staging = buf(192, GPUBufferUsage.MAP_READ | CD);
-  const GATHER_BYTES = GATHER_K * (GS + 4) * 4;
+  const GATHER_BYTES = GATHER_K * (GS + 6) * 4;
   const PICK_R = 3, PICK_W = 2 * PICK_R + 1, PICK_BYTES = PICK_W * PICK_W * FX * 4;
   const pickRead = buf(PICK_BYTES, GPUBufferUsage.MAP_READ | CD);
-  const PROBE_G = (GS + 4) * 4, PROBE_P = PROBE_G, PROBE_F = PROBE_P + PBYTES, PROBE_BYTES = PROBE_F + 5 * FX * 4;
+  const PROBE_G = (GS + 6) * 4, PROBE_P = PROBE_G, PROBE_F = PROBE_P + PBYTES, PROBE_BYTES = PROBE_F + 5 * FX * 4;
   const probeRead = buf(PROBE_BYTES, GPUBufferUsage.MAP_READ | CD);
   const gatherRead = buf(GATHER_BYTES, GPUBufferUsage.MAP_READ | CD);
 
@@ -1262,6 +1264,135 @@ async function main() {
     } catch (e) { console.warn('shared bank upload failed', e.message); }
   }
   const fmtWork = w => w >= 1e12 ? (w / 1e12).toFixed(1) + 'T' : w >= 1e9 ? (w / 1e9).toFixed(1) + 'B' : w >= 1e6 ? (w / 1e6).toFixed(1) + 'M' : Math.round(w / 1e3) + 'k';
+  // ----- the shared world: one territory map everyone sees -----
+  const WW = 64;                                      // territory cells per side (matches world.js)
+  let worldState = null, worldOwner = null, worldStr = null, worldBusy = false, lastWorld = -1e9, lastObserve = performance.now();
+  const genomeOf = new Map();                         // strain tag (hex) -> champion genome for planting
+  const obsCounts = new Map();                        // "cell,tag" -> samples seen since the last report
+  const knownStrains = () => new Set([strainHex, ...(worldState?.palette || []).map(p => p.tag), ...(shared?.strains || []).map(s => s.tag)]);
+  let known = new Set([strainHex]);
+  function observeSample(lineage, x, y) {
+    const tag = lineage.toString(16).padStart(8, '0');
+    if (!known.has(tag) || !Number.isFinite(x)) return;
+    const c = Math.floor(((y % G) + G) % G / G * WW) * WW + Math.floor(((x % G) + G) % G / G * WW);
+    const k = c + ',' + tag;
+    obsCounts.set(k, (obsCounts.get(k) || 0) + 1);
+  }
+  const terr = document.createElement('canvas'); terr.width = terr.height = 512;
+  const tctx = terr.getContext('2d');
+  const terrSmall = document.createElement('canvas'); terrSmall.width = terrSmall.height = WW;
+  const sctx = terrSmall.getContext('2d');
+  // stable per-cell jitter so colonies look grown, not gridded
+  const jit = new Float32Array(WW * WW * 3);
+  for (let i = 0; i < jit.length; i++) { const v = Math.sin(i * 12.9898 + 78.233) * 43758.5453; jit[i] = v - Math.floor(v); }
+  function paintTerritory() {
+    // lichen: overlapping soft blobs per cell (brighter where established), glowing hyphae along borders
+    const hues = (worldState.palette || []).map(p => strainHue(parseInt(p.tag, 16) >>> 0) * 360);
+    const S = terr.width, k = S / WW;
+    tctx.clearRect(0, 0, S, S);
+    tctx.globalCompositeOperation = 'lighter';
+    for (let c = 0; c < WW * WW; c++) {
+      const o = worldOwner[c]; if (!o) continue;
+      const x = (c % WW + 0.2 + jit[c * 3] * 0.6) * k, y = (((c / WW) | 0) + 0.2 + jit[c * 3 + 1] * 0.6) * k;
+      const r = k * (0.8 + jit[c * 3 + 2] * 0.5), a = 0.09 + (worldStr[c] / 255) * 0.24;
+      const g = tctx.createRadialGradient(x, y, 0, x, y, r);
+      g.addColorStop(0, `hsl(${hues[o - 1].toFixed(0)} 80% 55% / ${a})`);
+      g.addColorStop(1, `hsl(${hues[o - 1].toFixed(0)} 80% 45% / 0)`);
+      tctx.fillStyle = g; tctx.fillRect(x - r, y - r, 2 * r, 2 * r);
+    }
+    for (let y = 0; y < WW; y++) for (let x = 0; x < WW; x++) {
+      const c = y * WW + x, o = worldOwner[c]; if (!o) continue;
+      const ns = [worldOwner[y * WW + (x + 1) % WW], worldOwner[y * WW + (x + WW - 1) % WW], worldOwner[((y + 1) % WW) * WW + x], worldOwner[((y + WW - 1) % WW) * WW + x]];
+      if (ns.every(n => n === o)) continue;
+      const contested = ns.some(n => n && n !== o);
+      tctx.fillStyle = `hsl(${hues[o - 1].toFixed(0)} 95% ${contested ? 75 : 64}% / ${contested ? 0.8 : 0.45})`;
+      for (let d = 0; d < 3; d++) {
+        const px = (x + jit[(c * 3 + d) % jit.length]) * k, py = (y + jit[(c * 3 + d + 1) % jit.length]) * k;
+        tctx.beginPath(); tctx.arc(px, py, k * (contested ? 0.16 : 0.1), 0, 6.2832); tctx.fill();
+      }
+    }
+    tctx.globalCompositeOperation = 'source-over';
+  }
+  function hslRgb(h, s, l) {
+    const f = n => { const k = (n + h / 30) % 12, a = s * Math.min(l, 1 - l); return Math.round(255 * (l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1)))); };
+    return [f(0), f(8), f(4)];
+  }
+  async function pollWorld() {
+    if (!SHARED || worldBusy) return;
+    worldBusy = true;
+    try {
+      const r = await fetch('/api/world');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      worldState = await r.json();
+      const dec = b64 => Uint8Array.from(atob(b64), ch => ch.charCodeAt(0));
+      worldOwner = dec(worldState.owner); worldStr = dec(worldState.strength);
+      known = knownStrains();
+      paintTerritory();
+      const missing = worldState.palette.map(p => p.tag).filter(t => t !== strainHex && !genomeOf.has(t));
+      if (missing.length) {
+        const gr = await fetch('/api/world/genomes?tags=' + missing.join(','));
+        if (gr.ok) for (const [t, b] of Object.entries(await gr.json())) { const g = b64ToGenome(b); if (g && !validateGenome(g)) genomeOf.set(t, g); }
+      }
+      renderWorldBoard();
+    } catch (e) { console.warn('world poll failed', e.message); }
+    worldBusy = false;
+  }
+  async function reportWorld() {
+    if (!SHARED) return;
+    const obs = [...obsCounts].map(([k, n]) => { const [c, tag] = k.split(','); return [+c, tag, n]; });
+    obsCounts.clear();
+    try {
+      await fetch('/api/world/observe', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sid, strain: strainHex, node: myNode, rate: Math.round(document.hidden ? 0 : stepRate * stats.alive), obs }) });
+    } catch (e) { console.warn('world report failed', e.message); }
+  }
+  // the local dish mirrors the shared world: every few seconds an owned region is re-seeded with its owner's champion,
+  // so the real neural battles on this GPU happen along the shared borders
+  function seedFromWorld() {
+    if (!worldOwner || !$('worldSync').checked) return;
+    for (let tries = 0; tries < 20; tries++) {
+      const c = (Math.random() * WW * WW) | 0, o = worldOwner[c];
+      if (!o || Math.random() > worldStr[c] / 255) continue;
+      const tag = worldState.palette[o - 1].tag;
+      const g = tag === strainHex ? strainBest.g : genomeOf.get(tag);
+      if (!g) continue;
+      const cs = G / WW;
+      queuePlant({ genome: g }, ((c % WW) + 0.5) * cs, (((c / WW) | 0) + 0.5) * cs, cs * 0.7, 140);
+      return;
+    }
+  }
+  function renderWorldBoard() {
+    const pal = [...(worldState?.palette || [])].sort((a, b) => b.cells - a.cells);
+    const total = WW * WW;
+    const mine = pal.find(p => p.tag === strainHex);
+    $('territory').textContent = mine ? `you hold ${(100 * mine.cells / total).toFixed(1)}% of the world · power ${fmtWork(mine.power)}/s` : 'you hold no territory yet: keep watching, your strain spores at your node';
+    $('board').innerHTML = pal.slice(0, 8).map((p, i) => {
+      const hue = (strainHue(parseInt(p.tag, 16) >>> 0) * 360).toFixed(0);
+      return `<div class="srow"><span class="sw" style="background:hsl(${hue} 85% 60%)"></span>${i + 1}. ${p.tag.slice(0, 4)}·${p.tag.slice(4)}${p.tag === strainHex ? ' <b>you</b>' : ''}` +
+        `<span class="sr">${(100 * p.cells / total).toFixed(1)}% · ${p.power ? fmtWork(p.power) + '/s' : 'dormant'}</span></div>`;
+    }).join('') || '<div class="dim">the world is empty: be the first spore</div>';
+    $('events').innerHTML = (worldState?.events || []).map(e => {
+      const t = e.text.replace(/[0-9a-f]{8}/g, m => `<span style="color:hsl(${(strainHue(parseInt(m, 16) >>> 0) * 360).toFixed(0)} 85% 65%)">${m.slice(0, 4)}·${m.slice(4)}</span>`);
+      return `<div>${t}</div>`;
+    }).join('');
+  }
+  // the overlay follows the camera; the world wraps, so neighbouring copies are drawn too
+  const tview = $('terrview'), vctx = tview.getContext('2d');
+  function drawTerritoryView() {
+    const dpr = Math.min(devicePixelRatio || 1, 2);
+    if (tview.width !== canvas.width || tview.height !== canvas.height) { tview.width = canvas.width; tview.height = canvas.height; }
+    vctx.clearRect(0, 0, tview.width, tview.height);
+    if (!worldOwner || !$('showTerritory').checked || mode >= 3) return;
+    const size = G * cam.scale, ox = canvas.width / 2 - cam.cx * cam.scale, oy = canvas.height / 2 - cam.cy * cam.scale;
+    vctx.globalAlpha = 0.85;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const x = ox + dx * size, y = oy + dy * size;
+      if (x > tview.width || y > tview.height || x + size < 0 || y + size < 0) continue;
+      vctx.drawImage(terr, x, y, size, size);
+    }
+    vctx.globalAlpha = 1;
+  }
+
   // world map: every strain's node, in the shared coordinate system all dishes use
   function nodeList() {
     const list = (shared?.strains || []).filter(st => st.node && st.tag !== strainHex)
@@ -1273,6 +1404,7 @@ async function main() {
   function drawWorld() {
     const W = world.width;
     wctx.fillStyle = '#050607'; wctx.fillRect(0, 0, W, W);
+    if (worldOwner) { wctx.globalAlpha = 0.9; wctx.drawImage(terr, 0, 0, W, W); wctx.globalAlpha = 1; }
     wctx.strokeStyle = 'rgba(255,255,255,.06)'; wctx.lineWidth = 1;
     for (let k = 1; k < 4; k++) { wctx.beginPath(); wctx.moveTo(k * W / 4, 0); wctx.lineTo(k * W / 4, W); wctx.moveTo(0, k * W / 4); wctx.lineTo(W, k * W / 4); wctx.stroke(); }
     // current viewport
@@ -1507,9 +1639,11 @@ async function main() {
         gatherRead.unmap();
         const metaOff = GATHER_K * GS;
         for (let j = 0; j < GATHER_K; j++) {
-          const alive = all[metaOff + j * 4], kids = all[metaOff + j * 4 + 1];
+          const mo = metaOff + j * 6;
+          const alive = all[mo], kids = all[mo + 1];
+          if (alive) observeSample(all[j * GS + 4] >>> 0, asF32(all[mo + 4]), asF32(all[mo + 5]));
           if (!alive || kids < 1) continue;     // only proven reproducers enter the bank
-          const age = asF32(all[metaOff + j * 4 + 2]);
+          const age = asF32(all[mo + 2]);
           const g = all.slice(j * GS, (j + 1) * GS);
           bank.add(g, { kids, age });
           considerOwn(g, kids + age / 2000, kids >= 2);
@@ -1550,6 +1684,9 @@ async function main() {
       }
     }
     if (SHARED && now - lastSync > 60000) { lastSync = now; syncShared(); }
+    if (SHARED && now - lastWorld > 2000) { lastWorld = now; pollWorld(); }
+    if (SHARED && now - lastObserve > 5000) { lastObserve = now; reportWorld(); }
+    if (!paused && frameNo % 240 === 120) seedFromWorld();
     if (SHARED && now - lastUpload > 45000) { lastUpload = now; uploadShared(); }
 
     runPrePass(now);
@@ -1651,6 +1788,7 @@ async function main() {
     }
     placeRing();
     placeNodes();
+    drawTerritoryView();
     if (frameNo % 15 === 0) drawWorld();
     if (!fitDone && !paused && now - bootT > 3000) {
       if (now - bootT < 9000) fitSamples.push(fps);
