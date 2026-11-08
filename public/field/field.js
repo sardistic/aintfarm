@@ -10,7 +10,7 @@ const G = clampInt(qs.get('g'), 128, 2048, 768);    // field grid size
 const N_REQ = clampInt(qs.get('n'), 1024, 2_000_000, 262144);
 const SOURCES = 12;
 const FS = F + 1;                // sensed channels: F evolvable + density
-const FX = F + 2;                // field stride: + occupant id (who is in this cell, for gene transfer and bonding)
+const FX = F + 3;                // field stride: + occupant id (gene transfer, bonding) + kin energy share slot
 const KE = 4;                    // effect-gene slots per particle
 const EFFECTS = ['none', 'taxis', 'swirl', 'isoline', 'catalyse', 'jet', 'anchor', 'pressure', 'pulse', 'siphon', 'relay', 'heat', 'shield', 'drift', 'uptake', 'inject', 'bond'];
 const NT = EFFECTS.length;
@@ -35,6 +35,7 @@ const common = (N) => /* wgsl */`
 const F: u32 = ${F}u;
 const FS: u32 = ${FS}u;
 const FX: u32 = ${FX}u;
+const SHARE: u32 = ${F + 2}u;      // per-cell energy left by bonded kin; only the cell's occupant can collect it
 const KE: u32 = ${KE}u;
 const NT: u32 = ${NT}u;
 const HMAX: u32 = ${HMAX}u;
@@ -78,7 +79,8 @@ struct U {
   seedProb: f32, sun: f32, mouseOn: u32, metab: f32,
   mouse: vec2f, mouseR: f32, paramCost: f32,
   mutScale: f32, pressure: f32, plantCount: u32, plantR: f32,
-  plantPos: vec2f, cohesion: f32, pad1: f32,
+  plantPos: vec2f, cohesion: f32, learnOn: u32,
+  effectMask: u32, founderBias: u32, pad2: u32, pad3: u32,
   src: array<vec4f, ${SOURCES}>,
 };
 @group(0) @binding(0) var<uniform> u: U;
@@ -135,6 +137,7 @@ fn reset() {
   atomicStore(&counters[7], 0u);
   atomicStore(&counters[13], 0u);
   atomicStore(&counters[14], 0u);
+  atomicStore(&counters[15], 0u);
   for (var t = 0u; t < NT; t++) { atomicStore(&counters[16u + t], 0u); }
   atomicAdd(&counters[8], 1u);
 }
@@ -156,7 +159,8 @@ fn randomGenome(b: u32, lineage: u32) {
     sf(b, HDR + 2u * F + c, rndn() * 1.5);                                      // push along gradient
   }
   for (var s = 0u; s < KE; s++) {
-    let t = select(0u, 1u + min(u32(rnd() * f32(NT - 1u)), NT - 2u), rnd() < 0.5);
+    var t = select(0u, 1u + min(u32(rnd() * f32(NT - 1u)), NT - 2u), rnd() < 0.5);
+    if (u.founderBias == 1u && s < 2u && rnd() < 0.7) { t = select(16u, 3u, s == 0u); }   // membrane founders: isoline + bond
     sw(b, EOFF + s * 4u, packEffect(t, min(u32(rnd() * f32(FS)), F), min(u32(rnd() * f32(F)), F - 1u)));
     sf(b, EOFF + s * 4u + 1u, rndn() * 0.6);
     sf(b, EOFF + s * 4u + 2u, rnd());
@@ -258,6 +262,10 @@ fn step(@builtin(global_invocation_id) gid: vec3u) {
   p.mem = vec2f(tanh(o[MEM0]), tanh(o[MEM0 + 1u]));
 
   var e = p.energy;
+  if (occupant(here) == i + 1u) {                // collect energy bonded kin left in my cell
+    let sh = field[here * FX + SHARE];
+    if (sh > 0.0) { e += sh; dep(here, SHARE, -sh); }
+  }
 
   // --- effect genes: mutable physics primitives, each gated by the net ---
   let gDen = grd[F];
@@ -269,7 +277,7 @@ fn step(@builtin(global_invocation_id) gid: vec3u) {
     let base = EOFF + s * 4u;
     let tw = gw(b, base);
     let t = tw & 255u;
-    if (t == 0u || t >= NT) { continue; }
+    if (t == 0u || t >= NT || ((u.effectMask >> t) & 1u) == 1u) { continue; }
     let ca = min((tw >> 8u) & 255u, F);          // may be the density channel
     let cb = min((tw >> 16u) & 255u, F - 1u);
     let cs = min(ca, F - 1u);                     // ca restricted to real channels
@@ -371,6 +379,13 @@ fn step(@builtin(global_invocation_id) gid: vec3u) {
           let dist = max(length(dv), 1e-3);
           force += (dv / dist) * (dist - rest) * abs(p0) * gate * 1.5;
           force += (parts[j].vel - p.vel) * gate * 0.8;
+          let ej = parts[j].energy;
+          if (e > ej * 1.2 + 0.05) {                 // share energy downhill to kin (conserved: it waits in their cell)
+            let give = min((e - ej) * 0.05 * clamp(abs(p2), 0.0, 1.0) * gate, e * 0.05);
+            e -= give;
+            dep(cellIdx(i32(floor(parts[j].pos.x)), i32(floor(parts[j].pos.y))), SHARE, give);
+            atomicAdd(&counters[15], u32(give * 100000.0));
+          }
           bonded = true;
         }
         if (bonded) { atomicAdd(&counters[13], 1u); }
@@ -435,7 +450,7 @@ fn step(@builtin(global_invocation_id) gid: vec3u) {
   // --- learn: reward-modulated Hebbian update of this net's hidden->output weights (Lamarckian: children inherit them) ---
   let eta = gf(b, 8u);
   let dE = e - p.energy;
-  if (eta > 0.0005 && ((i + atomicLoad(&counters[8])) & 1u) == 0u) {
+  if (u.learnOn == 1u && eta > 0.0005 && ((i + atomicLoad(&counters[8])) & 1u) == 0u) {
     let m = tanh((dE - p.rbar) * 40.0);
     let lr = eta * m;
     for (var h = 0u; h < H; h++) {
@@ -614,6 +629,9 @@ fn fieldStep(@builtin(global_invocation_id) gid: vec3u) {
     sun += S.w * exp(-dot(d, d) / (S.z * S.z));
   }
   fieldOut[id * FX + FS] = bitcast<f32>(u32(atomicExchange(&deposit[id * FX + FS], 0)));   // occupant id
+  let shTot = max(field[id * FX + SHARE] + f32(atomicExchange(&deposit[id * FX + SHARE], 0)) / DSCALE, 0.0);
+  fieldOut[id * FX + SHARE] = shTot * 0.9;
+  let shareLeak = shTot * 0.1;                  // unclaimed kin energy returns to the commons
   for (var c = 0u; c < FS; c++) {
     let v = field[id * FX + c];
     let lap = field[l * FX + c] + field[r * FX + c] + field[dn * FX + c] + field[up * FX + c] - 4.0 * v;
@@ -626,7 +644,7 @@ fn fieldStep(@builtin(global_invocation_id) gid: vec3u) {
     let diff = select(0.03 + 0.17 * fract(fc * 2.618 + 0.3), 0.04, c == 0u);
     let decay = select(0.004 + 0.03 * fract(fc * 1.618 + 0.1), 0.0006, c == 0u);
     var nv = v + diff * lap - decay * v + d;
-    if (c == 0u) { nv += sun * u.sun; }
+    if (c == 0u) { nv += sun * u.sun + shareLeak; }
     fieldOut[id * FX + c] = clamp(nv, 0.0, 4.0);
   }
 }
@@ -856,7 +874,9 @@ async function main() {
   if (G * G * FX * 4 > maxBind) return fail(`Field ${G}×${G}×${FX} exceeds this GPU's buffer limit.`);
   const ainfo = adapter.info || {};
   console.log('adapter', ainfo.vendor, ainfo.architecture, ainfo.description, 'N', N, 'GS', GS, 'P', P);
+  const hasTS = adapter.features.has('timestamp-query');
   const device = await adapter.requestDevice({
+    requiredFeatures: hasTS ? ['timestamp-query'] : [],
     requiredLimits: {
       maxStorageBufferBindingSize: maxBind,
       maxBufferSize: lim.maxBufferSize,
@@ -881,7 +901,7 @@ async function main() {
 
   const S = GPUBufferUsage.STORAGE, CD = GPUBufferUsage.COPY_DST, CS = GPUBufferUsage.COPY_SRC;
   const buf = (size, usage) => device.createBuffer({ size, usage });
-  const UBYTES = 64 + SOURCES * 16;
+  const UBYTES = 80 + SOURCES * 16;
   const uni = buf(UBYTES, GPUBufferUsage.UNIFORM | CD);
   const camBuf = buf(32, GPUBufferUsage.UNIFORM | CD);
   const parts = buf(N * PBYTES, S | CD);
@@ -891,6 +911,10 @@ async function main() {
   const reqs = buf(Math.max(N * 8, GS * 4 + 16), S | CD);
   const freeList = buf(Math.max(N * 4, (GATHER_K * (GS + 4)) * 4), S | CS);
   const counters = buf(192, S | CS | CD);
+  const tsSet = hasTS ? device.createQuerySet({ type: 'timestamp', count: 2 }) : null;
+  const tsResolve = hasTS ? buf(16, GPUBufferUsage.QUERY_RESOLVE | CS) : null;
+  const tsRead = hasTS ? buf(16, GPUBufferUsage.MAP_READ | CD) : null;
+  let tsPending = false, simMs = 0;
   const staging = buf(192, GPUBufferUsage.MAP_READ | CD);
   const GATHER_BYTES = GATHER_K * (GS + 4) * 4;
   const gatherRead = buf(GATHER_BYTES, GPUBufferUsage.MAP_READ | CD);
@@ -951,7 +975,7 @@ async function main() {
   let tool = 'erase';
   const cam = { cx: G / 2, cy: G / 2, scale: 1 };
   const mouse = { x: 0, y: 0, down: false, panning: false, lx: 0, ly: 0 };
-  const stats = { alive: 0, births: 0, deaths: 0, params: 0, hidden: 0, gen: 0, uptakes: 0, injections: 0, bonded: 0, learners: 0, effects: new Array(NT).fill(0), pending: false };
+  const stats = { alive: 0, births: 0, deaths: 0, params: 0, hidden: 0, gen: 0, uptakes: 0, injections: 0, bonded: 0, learners: 0, shared: 0, effects: new Array(NT).fill(0), pending: false };
   let stepsDone = 0, stepRate = 0, fps = 0, rateT = performance.now(), rateSteps = 0, rateFrames = 0;
   const bank = new GeneBank();
   const BANK_KEY = `fieldlife-bank-v3-F${F}-H${HMAX}`;
@@ -1018,6 +1042,23 @@ async function main() {
   }, { passive: false });
 
   if (qs.has('noimm')) $('immigrate').checked = false;
+  if (qs.get('learn') === '0') $('learn').checked = false;
+  // ?off=bond,inject disables effect types (for A/B comparisons and profiling)
+  let effectMask = (qs.get('off') || '').split(',').reduce((m, n) => { const t = EFFECTS.indexOf(n.trim()); return t > 0 ? m | (1 << t) : m; }, 0);
+  let founderBias = qs.get('preset') === 'membranes' ? 1 : 0;
+  const PRESETS = {
+    default: { pressure: 0.3, cohesion: 0.15, bias: 0 },
+    membranes: { pressure: 0.55, cohesion: 0.4, bias: 1 },
+    soup: { pressure: 0.1, cohesion: 0.0, bias: 0 },
+  };
+  function applyPreset(name, resetToo) {
+    const pr = PRESETS[name]; if (!pr) return;
+    for (const id of ['pressure', 'cohesion']) { $(id).value = pr[id]; $(id).dispatchEvent(new Event('input')); }
+    founderBias = pr.bias;
+    if (resetToo) resetWorld();
+  }
+  $('preset').addEventListener('change', () => applyPreset($('preset').value, true));
+  if (PRESETS[qs.get('preset')]) { $('preset').value = qs.get('preset'); applyPreset(qs.get('preset'), false); }
   const modeSel = $('mode');
   modeSel.value = String(mode);
   modeSel.addEventListener('change', () => { mode = +modeSel.value; });
@@ -1145,10 +1186,11 @@ async function main() {
     uF[0] = seedProb; uF[1] = ui.sun; uU[2] = extra.mouseOn ?? 0; uF[3] = ui.metab;
     uF[4] = extra.mx ?? 0; uF[5] = extra.my ?? 0; uF[6] = extra.mr ?? 0; uF[7] = ui.pcost;
     uF[8] = ui.mut; uF[9] = ui.pressure; uU[10] = extra.count ?? 0; uF[11] = extra.pr ?? 0;
-    uF[12] = extra.px ?? 0; uF[13] = extra.py ?? 0; uF[14] = ui.cohesion;
+    uF[12] = extra.px ?? 0; uF[13] = extra.py ?? 0; uF[14] = ui.cohesion; uU[15] = $('learn').checked ? 1 : 0;
+    uU[16] = effectMask; uU[17] = founderBias;
     sources.forEach((s, k) => {
-      uF[16 + k * 4] = s.x; uF[17 + k * 4] = s.y; uF[18 + k * 4] = s.sigma;
-      uF[19 + k * 4] = s.base * (0.35 + 0.65 * (0.5 + 0.5 * Math.sin(s.phase)));
+      uF[20 + k * 4] = s.x; uF[21 + k * 4] = s.y; uF[22 + k * 4] = s.sigma;
+      uF[23 + k * 4] = s.base * (0.35 + 0.65 * (0.5 + 0.5 * Math.sin(s.phase)));
     });
     device.queue.writeBuffer(uni, 0, uData);
   }
@@ -1226,7 +1268,8 @@ async function main() {
     else writeUniforms({ mouseOn: mouse.down && !paused ? 1 : 0, mx: ((mouse.x % G) + G) % G, my: ((mouse.y % G) + G) % G, mr: brushWorld() });
 
     const enc = device.createCommandEncoder();
-    const pass = enc.beginComputePass();
+    const timeIt = hasTS && !tsPending && steps > 0;
+    const pass = enc.beginComputePass(timeIt ? { timestampWrites: { querySet: tsSet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 } } : undefined);
     if (seedProb > 0 && !paused) {
       pass.setBindGroup(0, cGroups[cur]);
       pass.setPipeline(K.reset); pass.dispatchWorkgroups(1);
@@ -1243,6 +1286,7 @@ async function main() {
       cur = 1 - cur;
     }
     pass.end();
+    if (timeIt) { enc.resolveQuerySet(tsSet, 0, 2, tsResolve, 0); enc.copyBufferToBuffer(tsResolve, 0, tsRead, 0, 16); }
     stepsDone += steps; rateSteps += steps;
 
     cam.cx = ((cam.cx % G) + G) % G; cam.cy = ((cam.cy % G) + G) % G;
@@ -1259,6 +1303,17 @@ async function main() {
     const readStats = !stats.pending && frameNo % 6 === 0;
     if (readStats) enc.copyBufferToBuffer(counters, 0, staging, 0, 192);
     device.queue.submit([enc.finish()]);
+    if (timeIt) {
+      tsPending = true;
+      const nSteps = steps;
+      tsRead.mapAsync(GPUMapMode.READ).then(() => {
+        const t = new BigInt64Array(tsRead.getMappedRange().slice(0));
+        tsRead.unmap();
+        const ms = Number(t[1] - t[0]) / 1e6 / nSteps;
+        if (ms > 0 && ms < 1000) simMs = simMs ? simMs * 0.9 + ms * 0.1 : ms;
+        tsPending = false;
+      }).catch(() => { tsPending = false; });
+    }
     if (readStats) {
       stats.pending = true;
       staging.mapAsync(GPUMapMode.READ).then(() => {
@@ -1267,7 +1322,7 @@ async function main() {
         stats.alive = c[2]; stats.births = c[3]; stats.deaths = c[4];
         stats.params = c[2] ? c[5] / c[2] : 0; stats.hidden = c[2] ? c[6] / c[2] : 0; stats.gen = c[7];
         stats.effects = Array.from(c.slice(16, 16 + NT));
-        stats.uptakes = c[11]; stats.injections = c[12]; stats.bonded = c[13]; stats.learners = c[14];
+        stats.uptakes = c[11]; stats.injections = c[12]; stats.bonded = c[13]; stats.learners = c[14]; stats.shared = c[15] / 100000;
         stats.pending = false;
       });
     }
@@ -1277,6 +1332,7 @@ async function main() {
       rateT = now; rateSteps = 0; rateFrames = 0;
       $('stats').textContent =
         `slots      ${N.toLocaleString()}\n` +
+        `gpu sim    ${hasTS ? (simMs ? simMs.toFixed(2) + ' ms/step' : '…') : 'n/a (no timestamp-query)'}\n` +
         `field      ${G}×${G}×${F} (+density)\n` +
         `net        ${NI} in → ≤${HMAX} hidden → ${NO} out\n` +
         `avg params ${stats.params.toFixed(0)}  (max ${P})\n` +
@@ -1286,7 +1342,7 @@ async function main() {
         `deaths     ${stats.deaths.toLocaleString()}\n` +
         `weights    ${(stats.alive * stats.params / 1e6).toFixed(1)}M live\n` +
         `learners   ${stats.alive ? (100 * stats.learners / stats.alive).toFixed(0) : 0}% learn within life\n` +
-        `bonded     ${stats.bonded.toLocaleString()} this step\n` +
+        `bonded     ${stats.bonded.toLocaleString()} this step · ${stats.shared.toFixed(2)} E shared\n` +
         `genes      ${stats.uptakes.toLocaleString()} taken · ${stats.injections.toLocaleString()} injected`;
       const tot = Math.max(1, stats.alive * KE);
       $('effects').textContent = EFFECTS.map((n, t) => [n, stats.effects[t] / tot]).filter(([n]) => n !== 'none')

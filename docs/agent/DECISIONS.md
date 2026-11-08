@@ -81,3 +81,9 @@ The field gained a second hidden slot per cell (stride F+2). It holds the id of 
 Three effect types use it: uptake (copy a gene in), inject (copy a gene out) and bond (spring plus velocity matching toward kin, judged by bond-key Hamming distance). Gene copies race benignly with the donor's own updates. Learning updates W2 in place in the genome: two packed f16 weights per word, every other step, only when the learning-rate gene is above 5e-4. That makes inheritance Lamarckian, and it avoids keeping a second weight copy, which would double genome memory.
 
 In a 60 s run at 131k slots, inject rose from 4.1% to 7.4% of gene slots, bond from 3.2% to 5.0%, and learners from 53% to 58%. The genome is now 371 words, and old gene banks are keyed separately (v3).
+
+## 2026-11-08 — Kin energy sharing, presets, learning toggle, GPU timing
+
+Energy moves between bonded particles through the field, not by writing another particle's state, which would race. The field stride grew to F+3, adding a per-cell SHARE slot. A bonded giver deposits into the receiver's cell. The cell's occupant collects the whole slot by depositing its negative, and 10% of what remains leaks into channel 0 each step. Every unit is accounted for, so sharing creates no energy.
+
+Uniforms gained `learnOn`, an `effectMask` (from `?off=`), and `founderBias` (the membrane preset makes 70% of founders' first two genes isoline and bond). The source array moved to byte offset 80. GPU time per step comes from a timestamp query around the compute pass, when the adapter supports it. Under heavy contention from another GPU workload, timings and A/B comparisons were not meaningful. Profile on an idle GPU.
