@@ -24,7 +24,7 @@
     @media (max-width: 700px) { #net { top: auto; bottom: 52px; font-size: 11px; } #net canvas { display: none; } }
     body.nogpu #net { display: none; }
     #hud { position: fixed; top: 6px; left: 8px; pointer-events: none; text-shadow: 0 0 3px #000, 0 0 3px #000; white-space: pre; }
-    #panel { position: fixed; top: 8px; right: 8px; width: 284px; max-height: calc(100vh - 16px); overflow-y: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; backdrop-filter: blur(6px); box-sizing: border-box; }
+    #panel { position: fixed; top: 8px; right: 8px; width: 284px; max-height: calc(100vh - 16px); overflow-y: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; backdrop-filter: blur(6px); box-sizing: border-box; z-index: 3; }
     #panel.collapsed > :not(header) { display: none; }
     #panel header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 6px; gap: 8px; }
     #panel h1 { font-size: 15px; margin: 0; letter-spacing: 0.12em; }
@@ -61,13 +61,28 @@
     #netc { width: 100%; height: 230px; display: block; border-radius: 4px; }
     #insp { white-space: pre-wrap; margin-top: 4px; }
     #world { width: 100%; aspect-ratio: 1; display: block; background: #050607; border: 1px solid var(--line); border-radius: 4px; margin: 6px 0; cursor: pointer; }
-    #nodes { position: fixed; inset: 0; pointer-events: none; overflow: hidden; }
+    #nodes { position: fixed; inset: 0; pointer-events: none; overflow: hidden; z-index: 1; }
     .node { position: absolute; left: -7px; top: -7px; width: 14px; height: 14px; border-radius: 3px; border: 2px solid hsl(var(--h) 85% 62%); box-shadow: 0 0 8px hsl(var(--h) 85% 50% / .8); box-sizing: border-box; }
     .node::after { content: ''; position: absolute; inset: 3px; background: hsl(var(--h) 85% 62%); border-radius: 1px; }
     .node span { position: absolute; left: 18px; top: -3px; white-space: nowrap; font-size: 10px; color: hsl(var(--h) 70% 75%); text-shadow: 0 0 3px #000, 0 0 3px #000; opacity: .75; }
     .node.mine { border-color: var(--amber); box-shadow: 0 0 12px rgba(247,207,90,.9); }
     .node.mine span { color: var(--amber); opacity: 1; font-weight: bold; }
     .node.off { opacity: .45; }
+    .node { pointer-events: auto; cursor: help; }
+    .node i { position: absolute; left: 18px; top: 10px; white-space: nowrap; font-size: 9px; font-style: normal; color: hsl(var(--h) 40% 70%); text-shadow: 0 0 3px #000, 0 0 3px #000; opacity: 0; transition: opacity .2s; }
+    .node:hover i { opacity: .9; }
+    .node:hover span { opacity: 1; }
+    #forces { margin: 4px 0; font-size: 11px; }
+    #forces > div { margin: 3px 0; }
+    #board .srow, #strains .srow { cursor: help; }
+    #arrive { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); max-width: min(460px, calc(100vw - 32px)); background: rgba(6,8,10,.9);
+      border: 1px solid rgba(111,227,168,.35); border-radius: 8px; padding: 16px 18px; backdrop-filter: blur(8px); box-shadow: 0 10px 40px rgba(0,0,0,.6); transition: opacity 1.2s; cursor: pointer; z-index: 4; }
+    #arrive.fade { opacity: 0; }
+    #arrive .big { font-size: 16px; color: var(--acc); margin-bottom: 6px; letter-spacing: .04em; }
+    #arrive .who { margin: 6px 0; }
+    #arrive .mine { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line); }
+    #arrive .tiny { font-size: 10px; margin-top: 6px; }
+    body.nogpu #arrive { display: none; }
     #ring { position: fixed; left: 0; top: 0; width: 28px; height: 28px; border: 2px solid var(--amber); border-radius: 50%; pointer-events: none; box-shadow: 0 0 10px rgba(247,207,90,.7); }
     #nogpu { position: fixed; inset: 0; display: grid; place-items: center; padding: 24px; background: #000; overflow: auto; }
     #nogpu[hidden] { display: none; }
@@ -137,6 +152,8 @@
     <div id="territory" class="dim"></div>
     <div id="board"></div>
     <div id="events" class="dim"></div>
+    <h2>OUTSIDE FORCES</h2>
+    <div id="forces"></div>
     <div class="row">
       <label class="check" title="Draw the shared territory over the dish"><input id="showTerritory" type="checkbox" checked> territory</label>
       <label class="check" title="Re-seed regions of your dish with the champion of the strain that holds them, so your GPU fights the real borders"><input id="worldSync" type="checkbox" checked> mirror the world</label>
@@ -171,6 +188,8 @@
       <p><b>aint farm</b> is an artificial intelligence neural training farm: an ant farm for AI. Every particle is its own neural net. Nets start random (untrained) and are never trained by gradients. Selection, and each particle's own lifetime learning, are what shape them.</p>
       <p><b>Your strain.</b> Your browser gets a permanent thumbprint: a strain tag, a colour, and a founder genome generated from it. About 40% of founders in your dish are your strain. Your strain is your GPU's champion: whenever your dish evolves a net that out-reproduces your strain's best, that net takes over your thumbprint. Descendants carry the tag forever. Their best genomes enter the shared gene bank, and each visit resumes from your strain's most advanced genome. Every viewer contributes: the <i>GPU commit</i> slider sets how much of your card the farm uses, from 20% to 100%, and the network meter at the top shows everyone's live total and your share. Every particle-step your GPU simulates is credited to your strain's score, and immigration into everyone's dish favours strains with more GPU work behind them. The longer you run, the further your strain evolves and spreads.</p>
       <p><b>The world.</b> Everyone shares one living territory map, drawn over the dish like lichen. Strains spore at their node and creep outward, powered by the GPUs of their viewers who are watching right now. Your dish mirrors the world: each region is re-seeded with the champion of whoever holds it, so the real neural battles on your GPU happen along the shared borders. Your dish reports which strains it actually sees surviving where, weighted by your GPU's power, and those reports move the borders for everyone. A strain whose viewers leave slowly erodes unless its genes keep winning in other people's dishes. The most effective strain wins.</p>
+      <p><b>Strains have natures.</b> Every strain gets a name and a signature gene fixed by its thumbprint, always its strongest effect, so its particles carry that body plan. The signature also shapes its land: Darters and Seekers creep fast, Holdfasts and Membranes are hard to take, Colonies get stronger with kin around, Spores and Drifters jump past their front, Leeches feed on failed attacks, Scavengers take dormant land. Hover any strain or node to light up its particles in your dish.</p>
+      <p><b>Outside forces.</b> While anyone is watching, nature intervenes: droughts dry land out and dim the suns over it in every dish, blooms make land fertile and make suns blaze, and storms scramble borders and raise mutation everywhere. Chaos comes as the Blight, a virus with genes of its own. It breaks out in the biggest territory, eats into its neighbours, and mutates every minute, keeping mutations that spread and reverting ones that don't. It drifts toward hunting whichever kind of strain is winning. In the dish it is a gene-injecting parasite. Carapaces resist it, gene-swappers catch it, and strong territory burns it out. Land nobody is watching goes dormant: it fades but holds until someone takes it.</p>
       <p><b>Your node.</b> Every strain has one node: the spot in the world where it enters every visitor's dish. Yours is random until you place it with the <i>node</i> tool. The world map shows every strain's node, and all dishes share the same coordinates, so an immigrant from another visitor's strain always arrives at its node.</p>
       <p><b>The shared gene bank</b> is a vector database of evolved nets, one for all visitors. Every second your GPU samples genomes that have reproduced and embeds each as a 49-dim vector: chemistry, effects, architecture, and a fingerprint of its weights. A newcomer that lands in an existing niche replaces it only if it's fitter. Otherwise it opens a new niche. The map is a live PCA of that space.</p>
       <p>Particles never interact directly. They read, absorb from, and write to a shared field. Channel 0 is energy from drifting suns. Channels 1–7 are information. Hidden channels record density, who is in each cell, and energy left for kin.</p>
@@ -189,6 +208,7 @@
   </section>
   <div id="ring" hidden></div>
   <div id="nodes"></div>
+  <section id="arrive" hidden><div id="arriveBody"></div><div id="arriveProgress" class="dim"></div><div class="dim tiny">click to close</div></section>
   <section id="nogpu" hidden>
     <div class="card">
       <h1>AINT FARM</h1>

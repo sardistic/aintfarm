@@ -3,7 +3,9 @@
 // (F evolvable channels + a density channel). All simulation state lives on the GPU (WebGPU compute).
 // A CPU-side gene bank archives evolved genomes as phenotype vectors (nearest-neighbour niches).
 
-import { EFFECTS, layout, makeGenomeTools, asF32, genomeToB64, b64ToGenome, strainTagOf, strainHue, makeFounder } from './genebank.js';
+import { EFFECTS, layout, makeGenomeTools, asF32, genomeToB64, b64ToGenome, strainTagOf, strainHue, makeFounder,
+  applySignature, strainName, strainProfile, strainSignature, SIGNATURES } from './genebank.js';
+const BLIGHT = 'b119b700';                           // the world's evolving virus (matches world.js)
 
 const qs = new URLSearchParams(location.search);
 const F = clampInt(qs.get('f'), 4, 16, 8);          // evolvable field channels (ch0 = energy)
@@ -940,11 +942,11 @@ async function main() {
   const strainTag = strainTagOf(visitorId);
   const strainHex = strainTag.toString(16).padStart(8, '0');
   const STRAIN_KEY = `fieldlife-strain-v1-F${F}-H${HMAX}`;
-  let strainBest = { g: makeFounder(L, strainTag), score: -1, gen: 0 };
+  let strainBest = { g: applySignature(L, makeFounder(L, strainTag), strainTag), score: -1, gen: 0 };
   try {
     const st = JSON.parse(localStorage.getItem(STRAIN_KEY) || 'null');
     const g = st && b64ToGenome(st.g);
-    if (g && !validateGenome(g) && (g[4] >>> 0) === strainTag) strainBest = { g, score: st.score || 0, gen: g[5] };
+    if (g && !validateGenome(g) && (g[4] >>> 0) === strainTag) strainBest = { g: applySignature(L, g, strainTag), score: st.score || 0, gen: g[5] };
   } catch {}
   // Your strain is your GPU's champion: the most successful net your dish has produced (offspring, age, generation).
   // When a better one appears it takes over your thumbprint (lineage tag + hue), so the strain keeps advancing while you run.
@@ -955,7 +957,7 @@ async function main() {
     if ((!own && !local) || validateGenome(g)) return;
     const score = fitness + g[5] * 0.05;
     if (score <= strainBest.score) return;
-    const t = Uint32Array.from(g);
+    const t = applySignature(L, g, strainTag);   // your strain always carries its signature gene
     t[4] = strainTag;
     const dv = new DataView(new ArrayBuffer(4)); dv.setFloat32(0, strainHue(strainTag), true); t[3] = dv.getUint32(0, true);
     strainBest = { g: t, score, gen: t[5] };
@@ -968,7 +970,7 @@ async function main() {
   function adoptFounder() {
     if (strainBest.score >= 0 || !bank.entries.length) return false;
     const best = bank.entries.reduce((a, b) => (b.fitness > a.fitness ? b : a));
-    const g = Uint32Array.from(best.genome);
+    const g = applySignature(L, best.genome, strainTag);
     g[4] = strainTag; g[5] = 0;
     const dv = new DataView(new ArrayBuffer(4)); dv.setFloat32(0, strainHue(strainTag), true); g[3] = dv.getUint32(0, true);
     strainBest = { g, score: 0, gen: 0 };
@@ -1288,7 +1290,9 @@ async function main() {
   for (let i = 0; i < jit.length; i++) { const v = Math.sin(i * 12.9898 + 78.233) * 43758.5453; jit[i] = v - Math.floor(v); }
   function paintTerritory() {
     // lichen: overlapping soft blobs per cell (brighter where established), glowing hyphae along borders
-    const hues = (worldState.palette || []).map(p => strainHue(parseInt(p.tag, 16) >>> 0) * 360);
+    const pal = worldState.palette || [];
+    const hues = pal.map(p => hueOf(p.tag)), sat = pal.map(p => p.tag === BLIGHT ? 45 : p.power ? 80 : 25);
+    const marks = pal.map(p => p.tag === BLIGHT ? 'blight' : sigOfHex(p.tag)[2]);
     const S = terr.width, k = S / WW;
     tctx.clearRect(0, 0, S, S);
     tctx.globalCompositeOperation = 'lighter';
@@ -1297,8 +1301,8 @@ async function main() {
       const x = (c % WW + 0.2 + jit[c * 3] * 0.6) * k, y = (((c / WW) | 0) + 0.2 + jit[c * 3 + 1] * 0.6) * k;
       const r = k * (0.8 + jit[c * 3 + 2] * 0.5), a = 0.09 + (worldStr[c] / 255) * 0.24;
       const g = tctx.createRadialGradient(x, y, 0, x, y, r);
-      g.addColorStop(0, `hsl(${hues[o - 1].toFixed(0)} 80% 55% / ${a})`);
-      g.addColorStop(1, `hsl(${hues[o - 1].toFixed(0)} 80% 45% / 0)`);
+      g.addColorStop(0, `hsl(${hues[o - 1].toFixed(0)} ${sat[o - 1]}% ${o && marks[o - 1] === 'blight' ? 30 : 55}% / ${a})`);
+      g.addColorStop(1, `hsl(${hues[o - 1].toFixed(0)} ${sat[o - 1]}% 45% / 0)`);
       tctx.fillStyle = g; tctx.fillRect(x - r, y - r, 2 * r, 2 * r);
     }
     for (let y = 0; y < WW; y++) for (let x = 0; x < WW; x++) {
@@ -1313,7 +1317,48 @@ async function main() {
       }
     }
     tctx.globalCompositeOperation = 'source-over';
+    // holdouts embody their strain's body plan: comets streak, rings bond, diamonds fortify, stars spore, dashes wall off
+    for (let c = 0; c < WW * WW; c++) {
+      const o = worldOwner[c]; if (!o || jit[c * 3 + 2] > 0.45) continue;
+      const m = marks[o - 1], x = (c % WW + 0.5) * k, y = (((c / WW) | 0) + 0.5) * k, z = k * (0.22 + worldStr[c] / 255 * 0.2);
+      tctx.strokeStyle = tctx.fillStyle = `hsl(${hues[o - 1].toFixed(0)} ${sat[o - 1]}% ${m === 'blight' ? 40 : 70}% / ${0.25 + worldStr[c] / 255 * 0.45})`;
+      tctx.lineWidth = Math.max(1, k * 0.08);
+      tctx.beginPath();
+      const ang = jit[c * 3] * 6.283;
+      if (m === '☄') { tctx.moveTo(x - Math.cos(ang) * z * 1.6, y - Math.sin(ang) * z * 1.6); tctx.lineTo(x + Math.cos(ang) * z, y + Math.sin(ang) * z); tctx.stroke(); tctx.beginPath(); tctx.arc(x + Math.cos(ang) * z, y + Math.sin(ang) * z, z * 0.3, 0, 6.283); tctx.fill(); }
+      else if (m === '◯') { tctx.arc(x, y, z, 0, 6.283); tctx.stroke(); }
+      else if (m === '◆') { tctx.moveTo(x, y - z); tctx.lineTo(x + z, y); tctx.lineTo(x, y + z); tctx.lineTo(x - z, y); tctx.closePath(); tctx.fill(); }
+      else if (m === '✦') { for (let r = 0; r < 4; r++) { const a2 = r * 1.5708 + ang; tctx.moveTo(x, y); tctx.lineTo(x + Math.cos(a2) * z * 1.3, y + Math.sin(a2) * z * 1.3); } tctx.stroke(); }
+      else if (m === '▬') { tctx.moveTo(x - z * 1.3, y); tctx.lineTo(x + z * 1.3, y); tctx.lineWidth = k * 0.16; tctx.stroke(); }
+      else if (m === 'blight') { for (let r = 0; r < 3; r++) { tctx.moveTo(x + (jit[(c * 3 + r) % jit.length] - 0.5) * k, y + (jit[(c * 3 + r + 1) % jit.length] - 0.5) * k); tctx.arc(x + (jit[(c * 3 + r) % jit.length] - 0.5) * k, y + (jit[(c * 3 + r + 1) % jit.length] - 0.5) * k, z * 0.35, 0, 6.283); } tctx.fill(); }
+      else { tctx.arc(x, y, z * 0.45, 0, 6.283); tctx.fill(); }
+    }
+    // nature: droughts parch, blooms glow, storms swirl
+    for (const e of worldState.nature || []) {
+      const x = (e.x + 0.5) * k, y = (e.y + 0.5) * k, r = e.r * k, fade = Math.min(1, e.left / 20);
+      for (const [ox, oy] of [[0, 0], [S, 0], [-S, 0], [0, S], [0, -S]]) {
+        const g = tctx.createRadialGradient(x + ox, y + oy, r * 0.2, x + ox, y + oy, r);
+        const col = e.kind === 'drought' ? '35 70% 45%' : e.kind === 'bloom' ? '130 80% 60%' : '270 70% 65%';
+        g.addColorStop(0, `hsl(${col} / ${0.22 * fade})`); g.addColorStop(1, `hsl(${col} / 0)`);
+        tctx.fillStyle = g; tctx.fillRect(x + ox - r, y + oy - r, 2 * r, 2 * r);
+        tctx.strokeStyle = `hsl(${col} / ${0.5 * fade})`; tctx.lineWidth = 2; tctx.setLineDash(e.kind === 'storm' ? [k * 0.6, k * 0.5] : e.kind === 'drought' ? [k * 0.2, k * 0.4] : []);
+        tctx.beginPath(); tctx.arc(x + ox, y + oy, r, 0, 6.283); tctx.stroke(); tctx.setLineDash([]);
+      }
+      tctx.fillStyle = `hsl(0 0% 90% / ${0.8 * fade})`; tctx.font = `${Math.round(k * 1.4)}px ui-monospace, monospace`; tctx.textAlign = 'center';
+      tctx.fillText(e.kind === 'drought' ? 'drought' : e.kind === 'bloom' ? 'bloom' : 'storm', x, y - r - k * 0.4); tctx.textAlign = 'start';
+    }
   }
+  // nature reaches into your dish: suns under a drought dim, suns in a bloom blaze, and storms raise mutation
+  function natureSun(sx, sy) {
+    let m = 1;
+    for (const e of worldState?.nature || []) {
+      const cs = G / WW, dx = Math.abs(sx - (e.x + 0.5) * cs), dy = Math.abs(sy - (e.y + 0.5) * cs);
+      const d = Math.hypot(Math.min(dx, G - dx), Math.min(dy, G - dy));
+      if (d < e.r * cs) m *= e.kind === 'drought' ? 0.25 : e.kind === 'bloom' ? 2.2 : 1;
+    }
+    return m;
+  }
+  const stormMut = () => (worldState?.nature || []).some(e => e.kind === 'storm') ? 2.2 : 1;
   function hslRgb(h, s, l) {
     const f = n => { const k = (n + h / 30) % 12, a = s * Math.min(l, 1 - l); return Math.round(255 * (l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1)))); };
     return [f(0), f(8), f(4)];
@@ -1329,12 +1374,14 @@ async function main() {
       worldOwner = dec(worldState.owner); worldStr = dec(worldState.strength);
       known = knownStrains();
       paintTerritory();
-      const missing = worldState.palette.map(p => p.tag).filter(t => t !== strainHex && !genomeOf.has(t));
+      if (worldState.blight && blightGen !== worldState.blight.gen) { blightGen = worldState.blight.gen; genomeOf.set(BLIGHT, makeBlight(worldState.blight)); }
+      const missing = worldState.palette.map(p => p.tag).filter(t => t !== strainHex && t !== BLIGHT && !genomeOf.has(t));
       if (missing.length) {
         const gr = await fetch('/api/world/genomes?tags=' + missing.join(','));
-        if (gr.ok) for (const [t, b] of Object.entries(await gr.json())) { const g = b64ToGenome(b); if (g && !validateGenome(g)) genomeOf.set(t, g); }
+        if (gr.ok) for (const [t, b] of Object.entries(await gr.json())) { const g = b64ToGenome(b); if (g && !validateGenome(g)) genomeOf.set(t, applySignature(L, g, parseInt(t, 16) >>> 0)); }
       }
       renderWorldBoard();
+      if (!hydrated) hydrate();
     } catch (e) { console.warn('world poll failed', e.message); }
     worldBusy = false;
   }
@@ -1363,6 +1410,78 @@ async function main() {
       return;
     }
   }
+  // ----- identity: names, profiles, colours -----
+  const tagNum = t => parseInt(t, 16) >>> 0;
+  const nameOf = t => t === BLIGHT ? 'the Blight' : strainName(tagNum(t));
+  const hueOf = t => t === BLIGHT ? 95 : strainHue(tagNum(t)) * 360;
+  const sigOfHex = t => SIGNATURES[strainSignature(tagNum(t))];
+  function profileOf(t) {
+    if (t === BLIGHT) return null;
+    const g = t === strainHex ? strainBest.g : genomeOf.get(t);
+    return g ? strainProfile(decodeGenome(g), tagNum(t)) : { ...strainProfile(decodeGenome(strainBest.g), tagNum(t)), also: [], brain: null };
+  }
+  const glyphOf = t => t === BLIGHT ? '☣' : sigOfHex(t)[2];
+  function describe(t) {
+    if (t === BLIGHT) {
+      const b = worldState?.blight;
+      return b ? `the Blight · gen ${b.gen} virus · virulence ${(b.vir * 100).toFixed(0)}% · hunts ${b.targets.map(s => SIGNATURES[s][0]).join(' and ')}` : 'the Blight';
+    }
+    const p = profileOf(t);
+    return `${p.name} ${p.glyph} · ${p.does}` + (p.brain ? ` · also ${p.also.join(', ') || 'nothing else'} · ${p.brain}-neuron brain${p.learns ? ', learns' : ''} · eats ${p.diet}, poisoned by ${p.poison}` : '');
+  }
+  const nameHtml = t => `<span style="color:hsl(${hueOf(t).toFixed(0)} ${t === BLIGHT ? '60%' : '85%'} 65%)">${glyphOf(t)} ${nameOf(t)}</span>`;
+  // the blight in the dish: a gene-injecting, energy-siphoning parasite rebuilt from its current genes
+  let blightGen = -1;
+  function makeBlight(b) {
+    const g = makeFounder(L, strainTagOf('blight:' + b.gen));
+    const dv = new DataView(new ArrayBuffer(4)), put = (k, v) => { dv.setFloat32(0, v, true); g[k] = dv.getUint32(0, true); };
+    const slots = [[15, 1.6], [9, 0.5 + b.vir], [14, 0.4 + b.spread * 3]];
+    slots.forEach(([t, p], k) => { g[L.EOFF + k * 4] = (t | (k << 8) | (k << 16)) >>> 0; put(L.EOFF + k * 4 + 1, Math.min(1.8, p)); });
+    g[4] = tagNum(BLIGHT); put(3, 0.26);
+    return validateGenome(g) ? null : g;
+  }
+  // joining: on the first look at the world, the dish is rebuilt from it, every holdout seeded with its owner's champion
+  let hydrated = false;
+  const hydrateQ = [];
+  function hydrate() {
+    hydrated = true;
+    if (!$('worldSync').checked) return;
+    const cs = G / WW, cells = [];
+    for (let c = 0; c < WW * WW; c++) if (worldOwner[c] && Math.random() < 0.25 + worldStr[c] / 255) cells.push(c);
+    for (let i = cells.length - 1; i > 0; i--) { const j = (Math.random() * (i + 1)) | 0; [cells[i], cells[j]] = [cells[j], cells[i]]; }
+    for (const c of cells.slice(0, 260)) {
+      const tag = worldState.palette[worldOwner[c] - 1].tag, g = tag === strainHex ? strainBest.g : genomeOf.get(tag);
+      if (g) hydrateQ.push({ g, x: ((c % WW) + 0.5) * cs, y: (((c / WW) | 0) + 0.5) * cs, r: cs * 0.95, n: Math.round(cs * cs * 1.4) });
+    }
+    hydrateTotal = hydrateQ.length;
+    showArrival();
+  }
+  let hydrateTotal = 0;
+  function drainHydrate() {
+    while (hydrateQ.length && plantQ.length < 4) { const h = hydrateQ.shift(); queuePlant({ genome: h.g }, h.x, h.y, h.r, h.n); }
+    const a = $('arrive');
+    if (!a.hidden && hydrateTotal) $('arriveProgress').textContent = hydrateQ.length ? `growing the holdouts into your dish… ${Math.round(100 * (1 - hydrateQ.length / hydrateTotal))}%` : 'your dish now mirrors the world';
+  }
+  const ago = ms => { const m = ms / 60000; return m < 90 ? `${Math.max(1, Math.round(m))} min` : m < 2880 ? `${Math.round(m / 60)} hours` : `${Math.round(m / 1440)} days`; };
+  function showArrival() {
+    const ws = worldState, pal = ws.palette.filter(p => p.tag !== BLIGHT).sort((a, b) => b.cells - a.cells);
+    const held = pal.reduce((a, p) => a + p.cells, 0), awake = pal.filter(p => p.power > 0).length;
+    const me = profileOf(strainHex), mine = pal.find(p => p.tag === strainHex);
+    const lines = [];
+    lines.push(`<div class="big">${pal.length ? `This world is ${ago(ws.now - (ws.born || ws.now))} old` : 'You are the first life in this world'}</div>`);
+    if (pal.length) lines.push(`<div>${pal.length} strain${pal.length === 1 ? '' : 's'} hold ${(100 * held / (WW * WW)).toFixed(0)}% of it · ${awake} awake, ${pal.length - awake} dormant</div>`);
+    pal.slice(0, 3).forEach((p, i) => lines.push(`<div class="who">${i + 1}. ${nameHtml(p.tag)} <span class="dim">${(100 * p.cells / (WW * WW)).toFixed(1)}%${p.first ? ' · since ' + ago(ws.now - p.first) + ' ago' : ''}${p.power ? '' : ' · dormant'}</span><br><span class="dim">${profileOf(p.tag).does}</span></div>`));
+    if (ws.blight?.cells) lines.push(`<div class="who">${nameHtml(BLIGHT)} <span class="dim">is loose: ${ws.blight.cells} cells, gen ${ws.blight.gen}</span></div>`);
+    lines.push(`<div class="mine">You are ${nameHtml(strainHex)}: ${me.does}.${mine ? ` You hold ${(100 * mine.cells / (WW * WW)).toFixed(1)}%.` : ' You spore at your node while you watch.'}</div>`);
+    $('arriveBody').innerHTML = lines.join('');
+    $('arrive').hidden = false;
+    setTimeout(() => { $('arrive').classList.add('fade'); setTimeout(() => { $('arrive').hidden = true; }, 1200); }, 14000);
+  }
+  $('arrive').addEventListener('click', () => { $('arrive').hidden = true; });
+  // hovering a strain anywhere lights up its particles in the dish
+  let hoverTag = null;
+  document.addEventListener('pointerover', e => { hoverTag = e.target.closest?.('[data-tag]')?.dataset.tag || null; });
+
   // live network power: every viewer's GPU contribution, and yours
   const spark = $('netSpark'), spctx = spark.getContext('2d');
   function renderNetwork() {
@@ -1389,15 +1508,16 @@ async function main() {
     const total = WW * WW;
     const mine = pal.find(p => p.tag === strainHex);
     $('territory').textContent = mine ? `you hold ${(100 * mine.cells / total).toFixed(1)}% of the world · power ${fmtWork(mine.power)}/s` : 'you hold no territory yet: keep watching, your strain spores at your node';
-    $('board').innerHTML = pal.slice(0, 8).map((p, i) => {
-      const hue = (strainHue(parseInt(p.tag, 16) >>> 0) * 360).toFixed(0);
-      return `<div class="srow"><span class="sw" style="background:hsl(${hue} 85% 60%)"></span>${i + 1}. ${p.tag.slice(0, 4)}·${p.tag.slice(4)}${p.tag === strainHex ? ' <b>you</b>' : ''}` +
-        `<span class="sr">${(100 * p.cells / total).toFixed(1)}% · ${p.power ? fmtWork(p.power) + '/s' : 'dormant'}</span></div>`;
-    }).join('') || '<div class="dim">the world is empty: be the first spore</div>';
-    $('events').innerHTML = (worldState?.events || []).map(e => {
-      const t = e.text.replace(/[0-9a-f]{8}/g, m => `<span style="color:hsl(${(strainHue(parseInt(m, 16) >>> 0) * 360).toFixed(0)} 85% 65%)">${m.slice(0, 4)}·${m.slice(4)}</span>`);
-      return `<div>${t}</div>`;
-    }).join('');
+    $('board').innerHTML = pal.slice(0, 8).map((p, i) =>
+      `<div class="srow" data-tag="${p.tag}" title="${describe(p.tag)}">${i + 1}. ${nameHtml(p.tag)}${p.tag === strainHex ? ' <b>you</b>' : ''}` +
+        `<span class="sr">${(100 * p.cells / total).toFixed(1)}% · ${p.tag === BLIGHT ? 'gen ' + (worldState.blight?.gen ?? 0) : p.power ? fmtWork(p.power) + '/s' : 'dormant'}</span></div>`
+    ).join('') || '<div class="dim">the world is empty: be the first spore</div>';
+    $('events').innerHTML = (worldState?.events || []).map(e => `<div>${e.text.replace(/[0-9a-f]{8}/g, m => nameHtml(m))}</div>`).join('');
+    const b = worldState?.blight, nat = worldState?.nature || [];
+    $('forces').innerHTML =
+      `<div data-tag="${BLIGHT}" title="${describe(BLIGHT)}">${nameHtml(BLIGHT)} · gen ${b?.gen ?? 0} · ${b?.cells ? b.cells + ' cells infected' : 'latent'}<br>` +
+      `<span class="dim">virulence ${((b?.vir || 0) * 100).toFixed(0)}% · hunts ${(b?.targets || []).map(s => SIGNATURES[s][0]).join(', ') || '—'}</span></div>` +
+      (nat.length ? nat.map(e => `<div><span style="color:${e.kind === 'drought' ? '#d9a050' : e.kind === 'bloom' ? '#7fe08a' : '#b98cf0'}">${e.kind}</span> <span class="dim">at ${e.x},${e.y} · ${e.left}s left${e.kind === 'storm' ? ' · mutation ×2.2 in every dish' : e.kind === 'drought' ? ' · suns dim there' : ' · suns blaze there'}</span></div>`).join('') : '<div class="dim">nature is calm</div>');
   }
   // the overlay follows the camera; the world wraps, so neighbouring copies are drawn too
   const tview = $('terrview'), vctx = tview.getContext('2d');
@@ -1461,13 +1581,16 @@ async function main() {
         el = document.createElement('div'); el.className = 'node' + (n.mine ? ' mine' : '');
         el.style.setProperty('--h', (strainHue(parseInt(n.tag, 16) >>> 0) * 360).toFixed(0));
         const label = document.createElement('span');
-        label.textContent = n.mine ? 'your node' : n.tag.slice(0, 4) + '·' + n.tag.slice(4);
+        label.textContent = `${glyphOf(n.tag)} ${nameOf(n.tag)}${n.mine ? ' (you)' : ''}`;
         el.appendChild(label);
+        const sub = document.createElement('i'); el.appendChild(sub);
+        el.dataset.tag = n.tag;
         $('nodes').appendChild(el); nodeEls.set(n.tag, el);
       }
       const sx = (wrap(n.x * G - cam.cx) * cam.scale + canvas.width / 2) / dpr, sy = (wrap(n.y * G - cam.cy) * cam.scale + canvas.height / 2) / dpr;
       el.style.transform = `translate(${sx.toFixed(1)}px, ${sy.toFixed(1)}px)`;
       el.classList.toggle('off', !n.online);
+      if (frameNo % 60 === 0) { el.title = describe(n.tag); el.lastChild.textContent = profileOf(n.tag).does; }
     }
     for (const [tag, el] of nodeEls) if (!keep.has(tag)) { el.remove(); nodeEls.delete(tag); }
   }
@@ -1477,7 +1600,8 @@ async function main() {
     const mine = shared?.mine;
     const share = stats.alive ? (100 * stats.mine / stats.alive) : 0;
     $('strainInfo').textContent =
-      `strain     ${strainHex.slice(0, 4)}·${strainHex.slice(4)}\n` +
+      `strain     ${nameOf(strainHex)} ${glyphOf(strainHex)} (${strainHex})\n` +
+      `signature  ${profileOf(strainHex).sig}: ${profileOf(strainHex).does}\n` +
       `node       ${(myNode.x * 100).toFixed(0)},${(myNode.y * 100).toFixed(0)}${myNode.chosen ? ' (chosen)' : ' (random — use node tool)'}\n` +
       `in dish    ${share.toFixed(1)}% (${stats.mine.toLocaleString()})\n` +
       `advanced   gen ${Math.max(strainBest.gen, mine?.bestGen || 0)}\n` +
@@ -1487,7 +1611,7 @@ async function main() {
     $('strains').innerHTML = rows.length ? rows.map((st, i) => {
       const hue = (strainHue(parseInt(st.tag, 16) >>> 0) * 360).toFixed(0);
       const you = st.tag === strainHex ? ' <b>you</b>' : '';
-      return `<div class="srow"><span class="sw" style="background:hsl(${hue} 85% 60%)"></span>${i + 1}. ${st.tag.slice(0, 4)}·${st.tag.slice(4)}${you}` +
+      return `<div class="srow" data-tag="${st.tag}" title="${describe(st.tag)}"><span class="sw" style="background:hsl(${hue} 85% 60%)"></span>${i + 1}. ${nameOf(st.tag)}${you}` +
         `<span class="sr">${fmtWork(st.work)} · gen ${st.bestGen} · ${st.niches}n${st.online ? ' ●' : ''}</span></div>`;
     }).join('') : '<div class="dim">no shared strains yet</div>';
     $('online').textContent = shared ? `${shared.online} online · ${shared.niches} shared niches · ${shared.contributors} contributors` : (SHARED ? 'connecting…' : 'offline (custom configuration)');
@@ -1566,12 +1690,12 @@ async function main() {
   function writeUniforms(extra = {}) {
     uF[0] = seedProb; uF[1] = ui.sun; uU[2] = extra.mouseOn ?? 0; uF[3] = ui.metab;
     uF[4] = extra.mx ?? 0; uF[5] = extra.my ?? 0; uF[6] = extra.mr ?? 0; uF[7] = ui.pcost;
-    uF[8] = ui.mut; uF[9] = ui.pressure; uU[10] = extra.count ?? 0; uF[11] = extra.pr ?? 0;
+    uF[8] = ui.mut * stormMut(); uF[9] = ui.pressure; uU[10] = extra.count ?? 0; uF[11] = extra.pr ?? 0;
     uF[12] = extra.px ?? 0; uF[13] = extra.py ?? 0; uF[14] = ui.cohesion; uU[15] = $('learn').checked ? 1 : 0;
     uU[16] = effectMask; uU[17] = founderBias; uU[18] = strainTag; uF[19] = extra.strainFrac ?? 0;
     sources.forEach((s, k) => {
       uF[20 + k * 4] = s.x; uF[21 + k * 4] = s.y; uF[22 + k * 4] = s.sigma;
-      uF[23 + k * 4] = s.base * (0.35 + 0.65 * (0.5 + 0.5 * Math.sin(s.phase)));
+      uF[23 + k * 4] = s.base * (0.35 + 0.65 * (0.5 + 0.5 * Math.sin(s.phase))) * natureSun(s.x, s.y);
     });
     device.queue.writeBuffer(uni, 0, uData);
   }
@@ -1712,6 +1836,7 @@ async function main() {
     if (!paused && frameNo % 240 === 120) seedFromWorld();
     if (SHARED && now - lastUpload > 45000) { lastUpload = now; uploadShared(); }
 
+    if (hydrateQ.length || !$('arrive').hidden) drainHydrate();
     runPrePass(now);
 
     // main uniforms: plant stage 1 clears its area via the eraser path this frame
@@ -1749,7 +1874,7 @@ async function main() {
     cam.cx = ((cam.cx % G) + G) % G; cam.cy = ((cam.cy % G) + G) % G;
     camF[0] = cam.cx; camF[1] = cam.cy; camF[2] = cam.scale; camU[3] = mode;
     camF[4] = canvas.width; camF[5] = canvas.height; camF[6] = Math.max(0.9, cam.scale * 0.42); camF[7] = ui.fgain;
-    camU[8] = strainTag; camU[9] = $('highlight').checked ? 1 : 0; camU[10] = $('pstyle').value === 'dots' ? 1 : 0;
+    camU[8] = hoverTag ? tagNum(hoverTag) : strainTag; camU[9] = hoverTag || $('highlight').checked ? 1 : 0; camU[10] = $('pstyle').value === 'dots' ? 1 : 0;
     device.queue.writeBuffer(camBuf, 0, camData);
 
     const rp = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }] });

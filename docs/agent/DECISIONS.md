@@ -126,3 +126,21 @@ Everyone polls the same state, so everyone sees the same world.
 **Rate limiting.** It moved from per-IP to per-session (plus a per-IP minute cap), because visitors behind one address were starving each other.
 
 **Trust.** Reports are unauthenticated, so the server bounds rather than verifies them: rate caps, per-report totals, and registered strains only. A determined spoofer could still push territory. Acceptable for a toy; revisit if abused.
+
+## 2026-11-08: An established world, strain natures, nature and chaos
+
+**Joining.** On its first world poll, a page rebuilds its dish from the world. Up to 260 owned cells (strength-weighted) are planted with their owner's champion through a drained queue, and an arrival card summarises the world: age, strains, the top three with what they do, the blight, and who you are.
+
+**Persistence.** Land nobody is watching erodes only to a dormant floor (0.12) and holds there until it is taken. It crumbles fully only after its strain has gone unseen for 14 days. The world records `born` and each strain's peak cells.
+
+**Strain natures.** Each strain's tag fixes a signature effect gene (`strainSignature`) and a name (adjective + signature noun, e.g. "Moss Membrane"). `applySignature` makes that gene the champion's strongest effect, so the strain's particles carry its body plan in every dish. Before this, every new strain was founded as a near clone of the fittest bank genome. In `world.js` the signature also sets territory traits:
+- spread, attack and defence multipliers;
+- jumps (Spore, Drifters);
+- leech;
+- scavenging dormant land;
+- colony defence;
+- blight resistance.
+
+**Outside forces act only while someone is watching,** so an empty world never decays from them.
+- **Nature:** up to 3 regional events at once. Droughts dry land and dim dish suns there. Blooms double growth and brighten suns. Storms scramble borders and raise dish mutation ×2.2.
+- **Chaos:** the Blight, a pseudo-strain (`b119b700`) that breaks out in the largest territory. Its genes are virulence, spread rate and a per-signature affinity. Every 60 ticks it hill-climbs: it keeps a mutation if it spread at least as well and reverts it otherwise. It also biases toward the leader's signature, which works against snowballing. It is capped at 8% of the world. In the dish it is a gene-injecting, siphoning parasite rebuilt from its generation, and nobody can report as it.

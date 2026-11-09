@@ -259,3 +259,65 @@ export function makeFounder(L, tag) {
   for (let k = 0; k < WWORDS; k++) g[WOFF + k] = (toHalf(rndn() * 0.45) | (toHalf(rndn() * 0.45) << 16)) >>> 0;
   return g;
 }
+
+// ----- strain identity: every strain has a signature effect gene (fixed by its tag), a name, and a body plan -----
+// [name noun, what the signature does, body glyph]
+export const SIGNATURES = [null,
+  ['Seekers', 'climbs chemical gradients', '☄'], ['Vortex', 'spins around what it senses', '☄'],
+  ['Contour', 'rides chemical contour lines', '▬'], ['Ferment', 'turns one chemical into another', '●'],
+  ['Darters', 'jets forward in bursts', '☄'], ['Holdfast', 'roots itself in place', '◆'],
+  ['Crush', 'shoves its neighbours aside', '●'], ['Pulsar', 'broadcasts chemical pulses', '●'],
+  ['Leech', 'drains energy from neighbours', '●'], ['Relay', 'passes signals between channels', '●'],
+  ['Ember', 'runs hot and restless', '●'], ['Carapace', 'shrugs off toxins', '◆'],
+  ['Drifters', 'wanders on its own current', '☄'], ['Scavenger', 'steals genes from cellmates', '✦'],
+  ['Spore', 'injects its genes into others', '✦'], ['Colony', 'bonds with kin and shares energy', '◯'],
+  ['Membrane', 'settles on borders and builds walls', '▬']];
+const ADJ = ['Ochre', 'Velvet', 'Ashen', 'Gilded', 'Pale', 'Crimson', 'Umber', 'Feral', 'Glass', 'Hollow', 'Iron', 'Lunar',
+  'Mire', 'Noble', 'Opal', 'Quiet', 'Rust', 'Salt', 'Thorn', 'Verdant', 'Woven', 'Amber', 'Bitter', 'Cinder', 'Dusk',
+  'Ember', 'Frost', 'Grey', 'Hazel', 'Ivory', 'Jade', 'Kelp', 'Lichen', 'Moss', 'Night', 'Onyx', 'Pearl', 'Quartz',
+  'Russet', 'Sable', 'Tidal', 'Umbral', 'Violet', 'Wild', 'Xeric', 'Yellow', 'Zinc', 'Cobalt'];
+export function strainSignature(tag) { return 1 + (strainTagOf('sig:' + (tag >>> 0)) >>> 3) % (EFFECTS.length - 1); }
+export function strainName(tag) {
+  return ADJ[(strainTagOf('name:' + (tag >>> 0)) >>> 5) % ADJ.length] + ' ' + SIGNATURES[strainSignature(tag)][0];
+}
+// Makes the signature gene the genome's strongest effect, so the strain's particles carry its body plan and trait.
+// Deterministic per tag: every dish applies the same signature to the same strain.
+export function applySignature(L, g, tag) {
+  const { EOFF, KE, F, FS } = L;
+  const out = Uint32Array.from(g);
+  const sig = strainSignature(tag);
+  let s = strainTagOf('sigp:' + (tag >>> 0));
+  const rnd = () => { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; return (s >>> 0) / 4294967296; };
+  const get = k => { f32view.setUint32(0, out[k], true); return f32view.getFloat32(0, true); };
+  const put = (k, v) => { f32view.setFloat32(0, v, true); out[k] = f32view.getUint32(0, true); };
+  let slot = -1, maxOther = 0, weakest = 0, wv = Infinity;
+  for (let k = 0; k < KE; k++) {
+    const t = out[EOFF + k * 4] & 255, p = Math.abs(get(EOFF + k * 4 + 1));
+    if (t === sig && slot < 0) { slot = k; continue; }
+    if (t) maxOther = Math.max(maxOther, p);
+    const v = t ? p : -1;
+    if (v < wv) { wv = v; weakest = k; }
+  }
+  const a = Math.floor(rnd() * F), b = Math.floor(rnd() * F), sign = rnd() < 0.75 ? 1 : -1, p1 = rnd(), p2 = (rnd() - 0.5) * 2;
+  if (slot < 0) {
+    slot = weakest;
+    out[EOFF + slot * 4] = (sig | (Math.min(a, FS - 1) << 8) | (Math.min(b, F - 1) << 16)) >>> 0;
+    put(EOFF + slot * 4 + 2, p1); put(EOFF + slot * 4 + 3, p2);
+    put(EOFF + slot * 4 + 1, sign * 0.9);
+  }
+  const cur = get(EOFF + slot * 4 + 1);
+  const mag = Math.min(1.8, Math.max(Math.abs(cur), maxOther + 0.15, 0.9));
+  put(EOFF + slot * 4 + 1, (cur < 0 ? -1 : 1) * mag);
+  return out;
+}
+// A readable profile of a strain's champion: signature, body, supporting genes, brain, learning, diet.
+export function strainProfile(dec, tag) {
+  const sig = strainSignature(tag);
+  const others = dec.effects.filter(e => e.t > 0 && e.t !== sig).sort((x, y) => Math.abs(y.p0) - Math.abs(x.p0)).map(e => EFFECTS[e.t]);
+  const F = dec.chem.egain.length;
+  let diet = 0, dv = -Infinity, poison = 0, pv = Infinity;
+  for (let c = 0; c < F; c++) { const v = dec.chem.egain[c] * dec.chem.absorb[c]; if (v > dv) { dv = v; diet = c; } if (v < pv) { pv = v; poison = c; } }
+  const ch = c => (c === 0 ? 'energy' : 'c' + c);
+  return { name: strainName(tag), sig: EFFECTS[sig], noun: SIGNATURES[sig][0], does: SIGNATURES[sig][1], glyph: SIGNATURES[sig][2],
+    also: [...new Set(others)].slice(0, 2), brain: dec.H, learns: dec.eta > 0.0005, gen: dec.gen, diet: ch(diet), poison: ch(poison) };
+}
